@@ -314,3 +314,92 @@ fn list_sources_walks_and_skips_ds_store() {
     }])
     .is_err());
 }
+
+// ------------------------------------------------------------ disk images (mount-backed)
+
+#[test]
+fn mounted_image_lists_and_extracts_like_a_directory() {
+    use archive_core::image::MountedImage;
+    use archive_core::Archive;
+    let d = tmp();
+    let vol = d.path().join("vol");
+    fs::create_dir_all(vol.join("App.app/Contents")).unwrap();
+    fs::write(vol.join("App.app/Contents/Info.plist"), b"<plist/>").unwrap();
+    fs::write(vol.join("README.txt"), b"read me").unwrap();
+    fs::create_dir_all(vol.join(".Trashes")).unwrap();
+    fs::write(vol.join(".DS_Store"), b"x").unwrap();
+    fs::create_dir_all(vol.join(".fseventsd")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("README.txt", vol.join("link")).unwrap();
+
+    let img =
+        MountedImage::from_directory(Path::new("/fake/image.dmg"), Format::Dmg, &vol).unwrap();
+    let mut got: Vec<String> = img
+        .entries()
+        .iter()
+        .map(|e| e.path.to_string_lossy().into_owned())
+        .collect();
+    got.sort();
+    #[cfg(unix)]
+    assert_eq!(
+        got,
+        vec![
+            "App.app",
+            "App.app/Contents",
+            "App.app/Contents/Info.plist",
+            "README.txt",
+            "link"
+        ]
+    );
+    assert_eq!(img.format(), Format::Dmg);
+    assert!(!img.format().is_writable());
+
+    let out = d.path().join("out");
+    let rep = img
+        .extract(
+            &[PathBuf::from("App.app")],
+            &out,
+            &ExtractOptions::default(),
+            NOOP,
+            &Cancel::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        fs::read(out.join("App.app/Contents/Info.plist")).unwrap(),
+        b"<plist/>"
+    );
+    assert!(!out.join("README.txt").exists());
+    assert_eq!(rep.written.len(), 1);
+    img.test(None, NOOP, &Cancel::new()).unwrap();
+    let r = img.copy_into(
+        &mut Builder::create(&d.path().join("x.zip"), &WriteOptions::default()).unwrap(),
+        &|_| None,
+        None,
+        NOOP,
+        &Cancel::new(),
+    );
+    assert!(matches!(r, Err(Error::ReadOnlyFormat(Format::Dmg))));
+}
+
+#[test]
+fn detects_iso_and_dmg_signatures() {
+    let d = tmp();
+    let iso = d.path().join("disc.bin");
+    let mut bytes = vec![0u8; 0x8001 + 5 + 100];
+    bytes[0x8001..0x8006].copy_from_slice(b"CD001");
+    fs::write(&iso, &bytes).unwrap();
+    assert_eq!(archive_core::detect_format(&iso).unwrap(), Format::Iso);
+    let dmg = d.path().join("image.bin");
+    let mut bytes = vec![0u8; 4096];
+    let n = bytes.len();
+    bytes[n - 512..n - 508].copy_from_slice(b"koly");
+    fs::write(&dmg, &bytes).unwrap();
+    assert_eq!(archive_core::detect_format(&dmg).unwrap(), Format::Dmg);
+    let by_ext = d.path().join("thing.dmg");
+    fs::write(&by_ext, vec![0u8; 2048]).unwrap();
+    assert_eq!(archive_core::detect_format(&by_ext).unwrap(), Format::Dmg);
+    // Opening on a non-macOS host cannot mount.
+    if !cfg!(target_os = "macos") {
+        assert!(matches!(open(&by_ext, None), Err(Error::UnsupportedFormat)));
+    }
+}

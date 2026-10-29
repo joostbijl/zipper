@@ -65,6 +65,8 @@
                 <string>public.bzip2-archive</string>
                 <string>org.tukaani.xz-archive</string>
                 <string>com.jaxeadv.zipper.zstd-archive</string>
+                <string>public.iso-image</string>
+                <string>com.apple.disk-image</string>
             </array>
         </dict>
     </array>
@@ -110,6 +112,21 @@
                 <string>org.bzip.bzip2-tar-archive</string>
                 <string>org.tukaani.tar-xz-archive</string>
                 <string>com.jaxeadv.zipper.tar-zstd-archive</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Disk image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.iso-image</string>
+                <string>com.apple.disk-image</string>
+                <string>com.apple.disk-image-udif</string>
+                <string>com.apple.disk-image-sparse</string>
             </array>
         </dict>
         <dict>

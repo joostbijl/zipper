@@ -13,6 +13,7 @@
 mod detect;
 mod error;
 mod fsutil;
+pub mod image;
 mod path;
 mod sevenz;
 mod stream;
@@ -43,6 +44,9 @@ pub enum Format {
     Xz,
     Bz2,
     Zst,
+    /// Disk images, read through a system mount (macOS `hdiutil`).
+    Iso,
+    Dmg,
 }
 
 impl Format {
@@ -65,6 +69,8 @@ impl Format {
             Format::Xz => "xz",
             Format::Bz2 => "bzip2",
             Format::Zst => "zstd",
+            Format::Iso => "ISO image",
+            Format::Dmg => "disk image",
         }
     }
 
@@ -82,6 +88,8 @@ impl Format {
             Format::Xz => "xz",
             Format::Bz2 => "bz2",
             Format::Zst => "zst",
+            Format::Iso => "iso",
+            Format::Dmg => "dmg",
         }
     }
 }
@@ -286,6 +294,7 @@ pub fn open_as(path: &Path, format: Format, password: Option<&str>) -> Result<Bo
         Format::Gz | Format::Xz | Format::Bz2 | Format::Zst => {
             Box::new(stream::StreamArchive::open(path, format)?)
         }
+        Format::Iso | Format::Dmg => Box::new(image::MountedImage::open(path, format, password)?),
     })
 }
 

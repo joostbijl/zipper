@@ -32,7 +32,9 @@ pub(crate) fn open_stream(path: &Path, format: Format) -> Result<Box<dyn Read>> 
         Format::TarBz2 | Format::Bz2 => Box::new(bzip2::read::MultiBzDecoder::new(file)),
         Format::TarXz | Format::Xz => Box::new(liblzma::read::XzDecoder::new_multi_decoder(file)),
         Format::TarZst | Format::Zst => Box::new(zstd::stream::read::Decoder::new(file)?),
-        Format::Zip | Format::SevenZ => return Err(Error::UnsupportedFormat),
+        Format::Zip | Format::SevenZ | Format::Iso | Format::Dmg => {
+            return Err(Error::UnsupportedFormat)
+        }
     })
 }
 

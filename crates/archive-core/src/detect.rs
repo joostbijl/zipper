@@ -39,6 +39,9 @@ pub fn detect_format(path: &Path) -> Result<Format> {
     if is_tar_header(head) {
         return Ok(Format::Tar);
     }
+    if let Some(f) = detect_image(&mut file, path)? {
+        return Ok(f);
+    }
 
     let outer = if head.starts_with(GZ_MAGIC) {
         Some(Outer::Gz)
@@ -77,6 +80,42 @@ pub fn detect_format(path: &Path) -> Result<Format> {
         Some(Format::Tar) => Ok(Format::Tar),
         _ => Err(Error::UnsupportedFormat),
     }
+}
+
+/// ISO 9660 ("CD001" in a volume descriptor at 32 KiB) and Apple UDIF disk
+/// images ("koly" trailer in the last 512 bytes). Both are only readable
+/// through a system mount, so detection is enough here.
+fn detect_image(file: &mut File, path: &Path) -> Result<Option<Format>> {
+    use std::io::{Seek, SeekFrom};
+    let len = file.metadata()?.len();
+    if len >= 512 {
+        file.seek(SeekFrom::End(-512))?;
+        let mut trailer = [0u8; 4];
+        if read_fully(file, &mut trailer)? == 4 && &trailer == b"koly" {
+            return Ok(Some(Format::Dmg));
+        }
+    }
+    for offset in [0x8001u64, 0x8801, 0x9001] {
+        if len < offset + 5 {
+            break;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut sig = [0u8; 5];
+        if read_fully(file, &mut sig)? == 5 && &sig == b"CD001" {
+            return Ok(Some(Format::Iso));
+        }
+    }
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if name.ends_with(".dmg") || name.ends_with(".sparseimage") || name.ends_with(".sparsebundle") {
+        return Ok(Some(Format::Dmg));
+    }
+    if name.ends_with(".iso") || name.ends_with(".cdr") || name.ends_with(".toast") {
+        return Ok(Some(Format::Iso));
+    }
+    Ok(None)
 }
 
 fn read_fully<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {

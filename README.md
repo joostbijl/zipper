@@ -6,11 +6,13 @@ inside it, or extract exactly the files you want to exactly the folder you
 want. See [SPEC.md](SPEC.md) for the full brief and [TESTING.md](TESTING.md)
 for the acceptance checklist.
 
-Status: **Phases 1–2 working on macOS; Phase 3 written, awaiting first run** (Quick Look, Settings).
+Status: **Phases 1–3 written; 1–2 confirmed working on macOS.** Phase 4: iso/dmg, Finder services.
 
 ## Formats
 
-Read: 7z, zip, tar, tar.gz, tar.bz2, tar.xz, tar.zst, gz, xz, bz2, zst.
+Read: 7z, zip, tar, tar.gz, tar.bz2, tar.xz, tar.zst, gz, xz, bz2, zst, and
+(on macOS, through a read-only `hdiutil` mount) iso and dmg, including
+encrypted dmg.
 Write: zip (AES-256), 7z (AES-256, encrypted headers).
 
 ## Building on the Mac
