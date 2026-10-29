@@ -24,8 +24,23 @@ cargo build --release -p zipper-app --target aarch64-apple-darwin
 open dist/Zipper.app
 ```
 
+Install into /Applications (also registers the Finder services):
+
+```sh
+scripts/install.sh
+```
+
 Make it the default for zip files: right-click a `.zip` → Get Info →
-Open With → Zipper → Change All.
+Open With → Zipper → Change All, or the button in Zipper → Settings….
+
+Starting the binary directly from Terminal (handy for seeing panics) means
+the window appears behind the Terminal: since macOS 14 an app launched that
+way may not take focus. Use `open dist/Zipper.app` or Finder for normal use.
+
+Finder right-click: "Add to Archive with Zipper" on any selection, "Extract
+with Zipper" on archives. They live in the Services submenu (Finder may show
+them directly). If missing, enable them in System Settings → Keyboard →
+Keyboard Shortcuts… → Services → Files and Folders.
 
 ## Cross-compiling on a Linux x86_64 builder
 

@@ -10,11 +10,12 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSDragOperation, NSDraggingDestination, NSDraggingInfo,
-    NSEventModifierFlags, NSFilenamesPboardType, NSMenu, NSMenuItem, NSModalResponse,
-    NSModalResponseOK, NSOpenPanel, NSTextAlignment, NSTextField, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
+    NSApplicationDelegate, NSAutoresizingMaskOptions, NSBackingStoreType, NSDragOperation,
+    NSDraggingDestination, NSDraggingInfo, NSEventModifierFlags, NSFilenamesPboardType, NSMenu,
+    NSMenuItem, NSModalResponse, NSModalResponseOK, NSOpenPanel, NSPasteboard,
+    NSRunningApplication, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     ns_string, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
@@ -45,6 +46,36 @@ pub fn open_path(path: PathBuf, mtm: MainThreadMarker) {
     let doc = Document::open(path, mtm);
     DOCUMENTS.with(|d| d.borrow_mut().push(doc));
     close_empty_window();
+    activate(mtm);
+}
+
+/// Bring the app to the front, the way macOS 14+ wants it done.
+pub fn activate(mtm: MainThreadMarker) {
+    let app = NSApplication::sharedApplication(mtm);
+    app.activate();
+    let _ = NSRunningApplication::currentApplication()
+        .activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
+}
+
+/// File paths on a pasteboard (drag or service).
+pub fn pasteboard_paths(pb: &NSPasteboard) -> Vec<PathBuf> {
+    let Some(list) = pb.propertyListForType(unsafe { NSFilenamesPboardType }) else {
+        return vec![];
+    };
+    let Some(arr) = list.downcast_ref::<NSArray>() else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for i in 0..arr.count() {
+        let obj = arr.objectAtIndex(i);
+        if let Some(s) = obj.downcast_ref::<NSString>() {
+            let p = PathBuf::from(s.to_string());
+            if p.exists() {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 /// Finder-style: archives open, anything else becomes one new archive
@@ -68,6 +99,7 @@ pub fn new_document(sources: Vec<PathBuf>, mtm: MainThreadMarker) {
     let doc = Document::new_untitled(sources, mtm);
     DOCUMENTS.with(|d| d.borrow_mut().push(doc));
     close_empty_window();
+    activate(mtm);
 }
 
 pub fn forget_document(doc: &Document) {
@@ -132,13 +164,14 @@ define_class!(
             let app = NSApplication::sharedApplication(mtm);
             app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
             app.setMainMenu(Some(&build_menu(mtm)));
+            // Finder "Services" entries (see NSServices in Info.plist).
+            let me: &AnyObject = self;
+            unsafe { app.setServicesProvider(Some(me)) };
         }
 
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _n: &NSNotification) {
-            let app = NSApplication::sharedApplication(self.mtm());
-            #[allow(deprecated)]
-            app.activateIgnoringOtherApps(true);
+            activate(self.mtm());
         }
 
         #[unsafe(method(application:openURLs:))]
@@ -199,6 +232,35 @@ define_class!(
         #[unsafe(method(showPreferences:))]
         fn show_preferences(&self, _sender: Option<&AnyObject>) {
             crate::prefs::show(self.mtm());
+        }
+
+        // Finder service: selected files → new archive, straight to Save.
+        #[unsafe(method(addToArchiveService:userData:error:))]
+        fn add_to_archive_service(&self, pboard: &NSPasteboard, _user_data: Option<&NSString>, _error: *mut *mut NSString) {
+            let paths = pasteboard_paths(pboard);
+            if paths.is_empty() {
+                return;
+            }
+            let mtm = self.mtm();
+            activate(mtm);
+            let doc = Document::new_untitled(paths, mtm);
+            DOCUMENTS.with(|d| d.borrow_mut().push(doc.clone()));
+            close_empty_window();
+            doc.save_now();
+        }
+
+        // Finder service: selected archives → open and extract everything.
+        #[unsafe(method(extractService:userData:error:))]
+        fn extract_service(&self, pboard: &NSPasteboard, _user_data: Option<&NSString>, _error: *mut *mut NSString) {
+            let mtm = self.mtm();
+            activate(mtm);
+            for p in pasteboard_paths(pboard) {
+                if p.is_file() && archive_core::detect_format(&p).is_ok() {
+                    let doc = Document::open_then_extract(p, mtm);
+                    DOCUMENTS.with(|d| d.borrow_mut().push(doc));
+                }
+            }
+            close_empty_window();
         }
     }
 );
@@ -380,23 +442,7 @@ impl DropView {
 
 pub fn dragged_paths(info: &ProtocolObject<dyn NSDraggingInfo>) -> Vec<PathBuf> {
     let pb = unsafe { info.draggingPasteboard() };
-    let Some(list) = pb.propertyListForType(unsafe { NSFilenamesPboardType }) else {
-        return vec![];
-    };
-    let Some(arr) = list.downcast_ref::<NSArray>() else {
-        return vec![];
-    };
-    let mut out = Vec::new();
-    for i in 0..arr.count() {
-        let obj = arr.objectAtIndex(i);
-        if let Some(s) = obj.downcast_ref::<NSString>() {
-            let p = PathBuf::from(s.to_string());
-            if p.exists() {
-                out.push(p);
-            }
-        }
-    }
-    out
+    pasteboard_paths(&pb)
 }
 
 define_class!(

@@ -118,6 +118,9 @@ pub struct DocIvars {
 
     /// Files currently shown in the Quick Look panel.
     quick_look: RefCell<Vec<PathBuf>>,
+    /// Set by the Finder "Extract with Zipper" service: extract everything
+    /// as soon as the archive has loaded.
+    extract_on_load: Cell<bool>,
 }
 
 define_class!(
@@ -388,6 +391,18 @@ impl Document {
         this.build_window(mtm);
         this.load(None);
         this
+    }
+
+    /// Open and, once loaded, start "Extract All" (Finder service).
+    pub fn open_then_extract(path: PathBuf, mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::open(path, mtm);
+        this.ivars().extract_on_load.set(true);
+        this
+    }
+
+    /// Show the Save panel (Finder "Add to Archive" service).
+    pub fn save_now(&self) {
+        self.begin_save();
     }
 
     /// A new, unsaved archive, optionally pre-filled with files.
@@ -672,6 +687,9 @@ impl Document {
                     unsafe { self.window().setRepresentedURL(Some(&path_to_url(&p))) };
                 }
                 self.update_status();
+                if self.ivars().extract_on_load.replace(false) {
+                    self.begin_extract(true);
+                }
             }
             Err(Error::PasswordRequired) | Err(Error::WrongPassword) => {
                 let retry = password.is_some();

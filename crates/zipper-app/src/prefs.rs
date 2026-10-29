@@ -138,6 +138,11 @@ define_class!(
                 .setBool_forKey(c.reveal.state() == NSControlStateValueOn, &ns(K_REVEAL));
         }
 
+        #[unsafe(method(makeDefault:))]
+        fn make_default(&self, _sender: Option<&AnyObject>) {
+            make_default_for(vec!["zip", "7z", "tar.gz", "tar", "xz"]);
+        }
+
         #[unsafe(method(trashChanged:))]
         fn trash_changed(&self, _sender: Option<&AnyObject>) {
             let c = self.ivars().controls.borrow();
@@ -185,7 +190,7 @@ impl PrefsController {
 
     fn build(&self, mtm: MainThreadMarker) {
         let me: &AnyObject = self;
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(480.0, 230.0));
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(480.0, 236.0));
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -285,11 +290,24 @@ impl PrefsController {
         ));
         root.addSubview(&trash);
 
-        let note =
-            NSTextField::wrappingLabelWithString(&ns("Changes take effect immediately."), mtm);
+        let default_button = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &ns("Open zip, 7z and tar files with Zipper…"),
+                Some(me),
+                Some(sel!(makeDefault:)),
+                mtm,
+            )
+        };
+        default_button.setFrame(NSRect::new(
+            NSPoint::new(176.0, 20.0),
+            NSSize::new(290.0, 28.0),
+        ));
+        root.addSubview(&default_button);
+
+        let note = NSTextField::wrappingLabelWithString(&ns("macOS asks once per file type."), mtm);
         note.setFrame(NSRect::new(
-            NSPoint::new(180.0, 20.0),
-            NSSize::new(280.0, 20.0),
+            NSPoint::new(180.0, 2.0),
+            NSSize::new(280.0, 18.0),
         ));
         note.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
         note.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(11.0)));
@@ -393,6 +411,32 @@ pub fn default_format_index() -> isize {
     } else {
         0
     }
+}
+
+/// Ask macOS to make this app the default for the given extensions, one
+/// system confirmation at a time. Content types are taken from empty sample
+/// files, which is what the API wants (no UTType bindings needed).
+fn make_default_for(mut exts: Vec<&'static str>) {
+    let Some(ext) = exts.first().copied() else {
+        return;
+    };
+    exts.remove(0);
+    let dir = std::env::temp_dir().join("Zipper").join("defaults");
+    let _ = std::fs::create_dir_all(&dir);
+    let sample = dir.join(format!("sample.{ext}"));
+    let _ = std::fs::write(&sample, b"");
+    let app_url = objc2_foundation::NSBundle::mainBundle().bundleURL();
+    let rest = exts.clone();
+    let block = RcBlock::new(move |_err: *mut objc2_foundation::NSError| {
+        let rest = rest.clone();
+        dispatch2::DispatchQueue::main().exec_async(move || make_default_for(rest));
+    });
+    objc2_app_kit::NSWorkspace::sharedWorkspace()
+        .setDefaultApplicationAtURL_toOpenContentTypeOfFileAtURL_completionHandler(
+            &app_url,
+            &path_to_url(&sample),
+            Some(&block),
+        );
 }
 
 #[allow(dead_code)]

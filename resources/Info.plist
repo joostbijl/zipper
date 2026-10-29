@@ -35,6 +35,40 @@
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.utilities</string>
 
+    <!-- Finder right-click → Services (or the Quick Actions / Services submenu). -->
+    <key>NSServices</key>
+    <array>
+        <dict>
+            <key>NSMenuItem</key>
+            <dict><key>default</key><string>Add to Archive with Zipper</string></dict>
+            <key>NSMessage</key>
+            <string>addToArchiveService</string>
+            <key>NSPortName</key>
+            <string>Zipper</string>
+            <key>NSSendFileTypes</key>
+            <array><string>public.item</string></array>
+        </dict>
+        <dict>
+            <key>NSMenuItem</key>
+            <dict><key>default</key><string>Extract with Zipper</string></dict>
+            <key>NSMessage</key>
+            <string>extractService</string>
+            <key>NSPortName</key>
+            <string>Zipper</string>
+            <key>NSSendFileTypes</key>
+            <array>
+                <string>public.zip-archive</string>
+                <string>org.7-zip.7z-archive</string>
+                <string>public.tar-archive</string>
+                <string>org.gnu.gnu-zip-archive</string>
+                <string>org.gnu.gnu-zip-tar-archive</string>
+                <string>public.bzip2-archive</string>
+                <string>org.tukaani.xz-archive</string>
+                <string>com.jaxeadv.zipper.zstd-archive</string>
+            </array>
+        </dict>
+    </array>
+
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>
