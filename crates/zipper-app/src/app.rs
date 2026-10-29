@@ -71,13 +71,18 @@ pub fn show_open_panel(mtm: MainThreadMarker) {
             return;
         }
         let urls = panel_c.URLs();
-        // SAFETY: completion handlers of AppKit panels run on the main thread.
-        let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        for i in 0..urls.count() {
-            if let Some(p) = url_to_path(&urls.objectAtIndex(i)) {
+        let paths: Vec<PathBuf> = (0..urls.count())
+            .filter_map(|i| url_to_path(&urls.objectAtIndex(i)))
+            .collect();
+        // Open on the next run-loop turn, after the panel's view service has
+        // been torn down, rather than inside its completion handler.
+        dispatch2::DispatchQueue::main().exec_async(move || {
+            // SAFETY: the main queue runs on the main thread.
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            for p in paths {
                 open_path(p, mtm);
             }
-        }
+        });
     });
     unsafe { panel.beginWithCompletionHandler(&block) };
 }
