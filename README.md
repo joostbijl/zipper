@@ -39,10 +39,13 @@ Starting the binary directly from Terminal (handy for seeing panics) means
 the window appears behind the Terminal: since macOS 14 an app launched that
 way may not take focus. Use `open dist/Zipper.app` or Finder for normal use.
 
-Finder right-click: "Add to Archive with Zipper" on any selection, "Extract
-with Zipper" on archives. They live in the Services submenu (Finder may show
-them directly). If missing, enable them in System Settings → Keyboard →
-Keyboard Shortcuts… → Services → Files and Folders.
+Finder right-click: `scripts/quick-actions.sh` (run by `install.sh`) installs
+two Quick Actions in `~/Library/Services` — "Add to Zipper Archive" on any
+selection and "Open in Zipper" on archives and disk images. Quick Actions show
+directly in the context menu; the app's own services ("Add to Archive with
+Zipper", "Extract with Zipper", which also start the save/extract step) sit in
+the Services submenu. Either kind may need a tick in System Settings →
+Keyboard → Keyboard Shortcuts… → Services → Files and Folders.
 
 ## Cross-compiling on a Linux x86_64 builder
 

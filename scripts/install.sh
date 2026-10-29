@@ -26,6 +26,8 @@ LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchService
 # Refresh the Services menu so "Add to Archive with Zipper" shows up in Finder.
 /System/Library/CoreServices/pbs -update >/dev/null 2>&1 || true
 
+scripts/quick-actions.sh
+
 echo "Installed $DEST/Zipper.app"
 echo "Make it the default for a file type: right-click a .zip → Get Info → Open With → Zipper → Change All,"
 echo "or use the button in Zipper → Settings…"
