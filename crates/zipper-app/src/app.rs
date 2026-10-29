@@ -52,11 +52,12 @@ pub fn forget_document(doc: &Document) {
 }
 
 fn close_empty_window() {
-    EMPTY_WINDOW.with(|w| {
-        if let Some(w) = w.borrow_mut().take() {
-            w.close();
-        }
-    });
+    // Take the window out first and drop the borrow: `close()` calls the
+    // delegate's windowWillClose: synchronously, which touches the same cell.
+    let window = EMPTY_WINDOW.with(|w| w.borrow_mut().take());
+    if let Some(w) = window {
+        w.close();
+    }
 }
 
 pub fn show_open_panel(mtm: MainThreadMarker) {
@@ -366,7 +367,12 @@ define_class!(
     unsafe impl NSWindowDelegate for EmptyWindowDelegate {
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _n: &NSNotification) {
-            EMPTY_WINDOW.with(|w| *w.borrow_mut() = None);
+            // May run re-entrantly from close_empty_window(); never panic here.
+            EMPTY_WINDOW.with(|w| {
+                if let Ok(mut slot) = w.try_borrow_mut() {
+                    *slot = None;
+                }
+            });
         }
     }
 );
