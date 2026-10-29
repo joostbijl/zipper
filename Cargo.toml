@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/archive-core", "crates/zipper-app"]
+# archive-core builds and tests everywhere; zipper-app only builds for macOS.
+# `cargo test -p archive-core` on Linux, `cargo build -p zipper-app --target aarch64-apple-darwin` for the app.
+default-members = ["crates/archive-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/joostbijl/maczip"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "unwind"

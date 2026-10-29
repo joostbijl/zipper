@@ -1,0 +1,36 @@
+[package]
+name = "archive-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Format-agnostic archive listing, extraction and writing (zip, 7z, tar.*)"
+
+[dependencies]
+thiserror = "2"
+tempfile = "3"
+filetime = "0.2"
+
+# 7z
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["aes256", "compress", "util"] }
+
+# zip
+zip = { version = "9", default-features = false, features = ["deflate", "bzip2", "zstd", "lzma", "aes-crypto", "time"] }
+
+# tar and single-stream compressors
+tar = "0.4"
+flate2 = "1"
+bzip2 = "0.6"
+liblzma = { version = "0.4", default-features = false, features = ["static"] }
+zstd = "0.14"
+
+[dev-dependencies]
+tempfile = "3"
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["aes256", "compress", "util"] }
+zip = { version = "9", default-features = false, features = ["deflate", "aes-crypto"] }
+tar = "0.4"
+flate2 = "1"
+bzip2 = "0.6"
+liblzma = { version = "0.4", default-features = false, features = ["static"] }
+zstd = "0.14"

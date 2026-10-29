@@ -1,0 +1,15 @@
+[package]
+name = "zipper-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native macOS archive manager (AppKit via objc2)"
+
+[[bin]]
+name = "Zipper"
+path = "src/main.rs"
+
+[dependencies]
+archive-core = { path = "../archive-core" }
