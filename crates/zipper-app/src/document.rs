@@ -1,8 +1,15 @@
-//! One open archive = one window. The `Document` object is the window's
-//! delegate, the outline view's data source/delegate and the target of the
-//! window's actions (Extract, Test, double-click, Cancel).
+//! One archive = one window. The `Document` object is the window's
+//! delegate, the outline view's data source/delegate, the file-promise
+//! delegate for drag-out, and the target of the window's actions.
+//!
+//! Two kinds of document:
+//! - an opened archive (`path` set, `archive` loaded); edits on a writable
+//!   format (zip, 7z) are applied immediately through `write::modify`;
+//! - a new, unsaved archive (`path` None): dropped files are kept as
+//!   `pending` sources and written on Save.
 
 use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,27 +17,33 @@ use std::time::{Duration, Instant};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
+use objc2::{
+    define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message,
+};
 use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSBackingStoreType, NSBezelStyle, NSButton, NSControlStateValueOff,
-    NSControlStateValueOn, NSControlTextEditingDelegate, NSImageView, NSModalResponse,
-    NSModalResponseOK, NSOpenPanel, NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate,
-    NSPanel, NSProgressIndicator, NSProgressIndicatorStyle, NSScrollView, NSTableCellView,
-    NSTableColumn, NSTableColumnResizingOptions, NSTableViewColumnAutoresizingStyle,
-    NSTableViewStyle, NSTextField, NSUserInterfaceItemIdentification, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSDragOperation, NSDraggingInfo,
+    NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSFilenamesPboardType, NSImageView,
+    NSMenuItem, NSMenuItemValidation, NSModalResponse, NSModalResponseOK, NSOpenPanel,
+    NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSOutlineViewDropOnItemIndex,
+    NSPanel, NSPasteboardWriting, NSPopUpButton, NSProgressIndicator, NSProgressIndicatorStyle,
+    NSSavePanel, NSScrollView, NSSecureTextField, NSTableCellView, NSTableColumn,
+    NSTableColumnResizingOptions, NSTableViewColumnAutoresizingStyle, NSTableViewStyle,
+    NSTextField, NSUserInterfaceItemIdentification, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
-    ns_string, NSArray, NSIndexSet, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
-    NSSize, NSSortDescriptor, NSString, NSURL,
+    ns_string, NSArray, NSError, NSIndexSet, NSNotification, NSObject, NSObjectProtocol,
+    NSOperationQueue, NSPoint, NSRect, NSSize, NSSortDescriptor, NSString, NSURL,
 };
 
+use archive_core::write::{self, Edit, Source, WriteOptions};
 use archive_core::{
-    Archive, Cancel, ConflictAction, ConflictDecision, Error, ExtractOptions, ExtractReport,
-    Overwrite, Progress,
+    Archive, Cancel, ConflictAction, ConflictDecision, Entry, EntryKind, Error, ExtractOptions,
+    ExtractReport, Format, Overwrite, Progress,
 };
 
-use crate::node::{build_tree, sort_tree, Node, SortKey};
+use crate::node::{build_tree_with, sort_tree, Node, SortKey};
 use crate::sheets;
 use crate::tasks::{spawn, MainHandle};
 use crate::util::{
@@ -49,6 +62,9 @@ enum Job {
     Extract,
     Test,
     OpenEntry,
+    Modify,
+    Save,
+    Promise,
 }
 
 struct ProgressUi {
@@ -56,8 +72,17 @@ struct ProgressUi {
     label: Retained<NSTextField>,
     bar: Retained<NSProgressIndicator>,
     shown: Cell<bool>,
-    shown_at: Cell<Option<Instant>>,
 }
+
+/// Controls of the Save panel accessory view.
+struct SaveUi {
+    format: Retained<NSPopUpButton>,
+    level: Retained<NSPopUpButton>,
+    password: Retained<NSSecureTextField>,
+    split: Retained<NSPopUpButton>,
+}
+
+type PromiseBlock = RcBlock<dyn Fn(*mut NSError)>;
 
 #[derive(Default)]
 pub struct DocIvars {
@@ -67,9 +92,12 @@ pub struct DocIvars {
     extract_button: OnceCell<Retained<NSButton>>,
     spinner: OnceCell<Retained<NSProgressIndicator>>,
     progress: OnceCell<ProgressUi>,
+    save_ui: RefCell<Option<SaveUi>>,
 
     path: RefCell<Option<PathBuf>>,
     archive: RefCell<Option<Arc<dyn Archive>>>,
+    /// New-document sources (top level), written on Save.
+    pending: RefCell<Vec<Source>>,
     roots: RefCell<Vec<Retained<Node>>>,
     password: RefCell<Option<String>>,
     temp_dir: RefCell<Option<PathBuf>>,
@@ -78,6 +106,10 @@ pub struct DocIvars {
     cancel: RefCell<Option<Arc<Cancel>>>,
     job: Cell<Option<Job>>,
     closed: Cell<bool>,
+
+    /// Drag-out promises waiting for their extraction to finish.
+    promises: RefCell<HashMap<u64, PromiseBlock>>,
+    next_promise: Cell<u64>,
 }
 
 define_class!(
@@ -128,6 +160,45 @@ define_class!(
                 p.label.setStringValue(&ns("Cancelling…"));
             }
         }
+
+        #[unsafe(method(addFiles:))]
+        fn add_files_action(&self, _sender: Option<&AnyObject>) {
+            self.begin_add_files();
+        }
+
+        #[unsafe(method(deleteSelected:))]
+        fn delete_action(&self, _sender: Option<&AnyObject>) {
+            self.begin_delete();
+        }
+
+        #[unsafe(method(renameSelected:))]
+        fn rename_action(&self, _sender: Option<&AnyObject>) {
+            self.begin_rename();
+        }
+
+        #[unsafe(method(renameCommitted:))]
+        fn rename_committed(&self, sender: Option<&AnyObject>) {
+            if let Some(tf) = sender.and_then(|s| s.downcast_ref::<NSTextField>()) {
+                self.rename_from_field(tf);
+            }
+        }
+
+        #[unsafe(method(saveDocument:))]
+        fn save_action(&self, _sender: Option<&AnyObject>) {
+            self.begin_save();
+        }
+
+        #[unsafe(method(saveFormatChanged:))]
+        fn save_format_changed(&self, _sender: Option<&AnyObject>) {
+            self.sync_save_ui();
+        }
+    }
+
+    unsafe impl NSMenuItemValidation for Document {
+        #[unsafe(method(validateMenuItem:))]
+        fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
+            self.validate(item)
+        }
     }
 
     // ---------------------------------------------------------- window
@@ -173,6 +244,47 @@ define_class!(
                 }
             }
         }
+
+        // Drag out of the window.
+        #[unsafe(method_id(outlineView:pasteboardWriterForItem:))]
+        unsafe fn pasteboard_writer(&self, _ov: &NSOutlineView, item: &AnyObject) -> Option<Retained<ProtocolObject<dyn NSPasteboardWriting>>> {
+            self.pasteboard_writer_for(item)
+        }
+
+        // Drop into the window.
+        #[unsafe(method(outlineView:validateDrop:proposedItem:proposedChildIndex:))]
+        unsafe fn validate_drop(&self, ov: &NSOutlineView, info: &ProtocolObject<dyn NSDraggingInfo>, item: Option<&AnyObject>, _index: isize) -> NSDragOperation {
+            if !self.can_edit() || self.ivars().job.get().is_some() {
+                return NSDragOperation::None;
+            }
+            if crate::app::dragged_paths(info).is_empty() {
+                return NSDragOperation::None;
+            }
+            // Retarget onto the folder row (or the whole table).
+            let target = match item.and_then(|i| i.downcast_ref::<Node>()) {
+                Some(n) if n.data().is_dir => Some(n.retain()),
+                Some(n) => unsafe { ov.parentForItem(Some(n)) }.and_then(|p| p.downcast::<Node>().ok()),
+                None => None,
+            };
+            let target_obj: Option<&AnyObject> = target.as_deref().map(|n| n as &AnyObject);
+            unsafe { ov.setDropItem_dropChildIndex(target_obj, NSOutlineViewDropOnItemIndex as isize) };
+            NSDragOperation::Copy
+        }
+
+        #[unsafe(method(outlineView:acceptDrop:item:childIndex:))]
+        #[allow(clippy::useless_conversion)]
+        unsafe fn accept_drop(&self, _ov: &NSOutlineView, info: &ProtocolObject<dyn NSDraggingInfo>, item: Option<&AnyObject>, _index: isize) -> bool {
+            let paths = crate::app::dragged_paths(info);
+            if paths.is_empty() {
+                return false.into();
+            }
+            let under = item
+                .and_then(|i| i.downcast_ref::<Node>())
+                .filter(|n| n.data().is_dir)
+                .map(|n| n.data().path.clone());
+            self.add_sources(paths, under);
+            true.into()
+        }
     }
 
     unsafe impl NSControlTextEditingDelegate for Document {}
@@ -186,6 +298,26 @@ define_class!(
         #[unsafe(method(outlineViewSelectionDidChange:))]
         fn selection_changed(&self, _n: &NSNotification) {
             self.update_status();
+        }
+    }
+
+    // ---------------------------------------------------------- drag-out promises
+    unsafe impl NSFilePromiseProviderDelegate for Document {
+        #[unsafe(method_id(filePromiseProvider:fileNameForType:))]
+        fn promise_file_name(&self, provider: &NSFilePromiseProvider, _file_type: &NSString) -> Retained<NSString> {
+            let path = promise_path(provider);
+            ns(&path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into()))
+        }
+
+        #[unsafe(method(filePromiseProvider:writePromiseToURL:completionHandler:))]
+        fn promise_write(&self, provider: &NSFilePromiseProvider, url: &NSURL, handler: &block2::DynBlock<dyn Fn(*mut NSError)>) {
+            self.write_promise(provider, url, handler);
+        }
+
+        #[unsafe(method_id(operationQueueForFilePromiseProvider:))]
+        fn promise_queue(&self, _provider: &NSFilePromiseProvider) -> Retained<NSOperationQueue> {
+            // Deliver on the main thread; the actual extraction runs on a worker.
+            NSOperationQueue::mainQueue()
         }
     }
 );
@@ -203,12 +335,46 @@ impl Document {
         this
     }
 
+    /// A new, unsaved archive, optionally pre-filled with files.
+    pub fn new_untitled(sources: Vec<PathBuf>, mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(DocIvars::default());
+        let this: Retained<Self> = unsafe { msg_send![super(this), init] };
+        this.build_window(mtm);
+        this.window().setTitle(ns_string!("Untitled archive"));
+        if let Some(l) = this.ivars().status.get() {
+            l.setStringValue(ns_string!(
+                "Drop files here or use Archive → Add Files…, then Save (⌘S)."
+            ));
+        }
+        if !sources.is_empty() {
+            this.add_sources(sources, None);
+        }
+        this
+    }
+
     pub fn window(&self) -> &NSWindow {
         self.ivars().window.get().expect("window built")
     }
 
     pub fn path(&self) -> Option<PathBuf> {
         self.ivars().path.borrow().clone()
+    }
+
+    fn is_new(&self) -> bool {
+        self.ivars().path.borrow().is_none()
+    }
+
+    /// Writable format, or a new document.
+    fn can_edit(&self) -> bool {
+        if self.is_new() {
+            return true;
+        }
+        self.ivars()
+            .archive
+            .borrow()
+            .as_ref()
+            .map(|a| a.format().is_writable())
+            .unwrap_or(false)
     }
 
     fn handle(&self) -> MainHandle<Self> {
@@ -218,7 +384,41 @@ impl Document {
     fn archive_name(&self) -> String {
         self.path()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "archive".into())
+            .unwrap_or_else(|| "Untitled archive".into())
+    }
+
+    fn busy(&self) -> bool {
+        self.ivars().job.get().is_some()
+    }
+
+    fn validate(&self, item: &NSMenuItem) -> bool {
+        let Some(action) = item.action() else {
+            return true;
+        };
+        let has_archive = self.ivars().archive.borrow().is_some();
+        let has_selection = self
+            .ivars()
+            .outline
+            .get()
+            .map(|ov| ov.selectedRow() >= 0)
+            .unwrap_or(false);
+        let busy = self.busy();
+        if action == sel!(extractSelected:)
+            || action == sel!(extractAll:)
+            || action == sel!(testArchive:)
+        {
+            has_archive && !busy
+        } else if action == sel!(openSelected:) {
+            (has_archive || self.is_new()) && has_selection && !busy
+        } else if action == sel!(addFiles:) {
+            self.can_edit() && !busy
+        } else if action == sel!(deleteSelected:) || action == sel!(renameSelected:) {
+            self.can_edit() && has_selection && !busy
+        } else if action == sel!(saveDocument:) {
+            self.is_new() && !self.ivars().pending.borrow().is_empty() && !busy
+        } else {
+            true
+        }
     }
 
     // ---------------------------------------------------------- building
@@ -265,7 +465,7 @@ impl Document {
             unsafe { NSOutlineView::initWithFrame(NSOutlineView::alloc(mtm), scroll_frame) };
         outline.setAllowsMultipleSelection(true);
         outline.setAllowsEmptySelection(true);
-        outline.setUsesAlternatingRowBackgroundColors(true);
+        outline.setUsesAlternatingRowBackgroundColors(false);
         outline.setColumnAutoresizingStyle(
             NSTableViewColumnAutoresizingStyle::FirstColumnOnlyAutoresizingStyle,
         );
@@ -290,6 +490,10 @@ impl Document {
             outline.setTarget(Some(me));
             outline.setDoubleAction(Some(sel!(outlineDoubleClicked:)));
         }
+        // Drag out (file promises) and drop in (Finder files).
+        outline.setDraggingSourceOperationMask_forLocal(NSDragOperation::Copy, false);
+        outline.registerForDraggedTypes(&NSArray::from_slice(&[unsafe { NSFilenamesPboardType }]));
+
         unsafe { scroll.setDocumentView(Some(&outline)) };
         root.addSubview(&scroll);
 
@@ -310,6 +514,7 @@ impl Document {
         ));
         status.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
         unsafe { status.setUsesSingleLineMode(true) };
+        status.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingMiddle);
         status.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(11.0)));
         status.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
         bar.addSubview(&status);
@@ -383,23 +588,25 @@ impl Document {
         self.set_busy(false, "");
         match result {
             Ok(archive) => {
-                let roots = build_tree(archive.entries());
-                *self.ivars().roots.borrow_mut() = roots;
+                let first_load = self.ivars().archive.borrow().is_none();
                 *self.ivars().archive.borrow_mut() = Some(archive);
                 *self.ivars().password.borrow_mut() = password;
-                if let Some(ov) = self.ivars().outline.get() {
-                    ov.reloadData();
-                    // Expand a single top-level folder so the user sees content immediately.
-                    let roots = self.ivars().roots.borrow();
-                    if roots.len() == 1 && roots[0].data().is_dir {
-                        let item: &AnyObject = &roots[0];
-                        unsafe { ov.expandItem(Some(item)) };
+                self.rebuild_tree();
+                if first_load {
+                    if let Some(ov) = self.ivars().outline.get() {
+                        // Expand a single top-level folder so the user sees content immediately.
+                        let roots = self.ivars().roots.borrow();
+                        if roots.len() == 1 && roots[0].data().is_dir {
+                            let item: &AnyObject = &roots[0];
+                            unsafe { ov.expandItem(Some(item)) };
+                        }
                     }
                 }
                 if let Some(b) = self.ivars().extract_button.get() {
                     b.setEnabled(true);
                 }
                 if let Some(p) = self.path() {
+                    self.window().setTitle(&ns(&self.archive_name()));
                     unsafe { self.window().setRepresentedURL(Some(&path_to_url(&p))) };
                 }
                 self.update_status();
@@ -433,6 +640,69 @@ impl Document {
         }
     }
 
+    /// Rebuild the node tree from the archive entries and/or pending sources,
+    /// keeping the current sort order and expansion of top-level folders.
+    fn rebuild_tree(&self) {
+        let mut roots = {
+            let archive = self.ivars().archive.borrow();
+            let pending = self.ivars().pending.borrow();
+            let pending_items = write::list_sources(&pending).unwrap_or_default();
+            let pending_entries: Vec<(Entry, PathBuf)> = pending_items
+                .into_iter()
+                .filter_map(|i| {
+                    let path = archive_core::safe_path(&i.name).ok()?;
+                    Some((
+                        Entry {
+                            path,
+                            kind: i.kind,
+                            size: Some(i.size),
+                            packed_size: None,
+                            modified: i.modified,
+                            encrypted: false,
+                        },
+                        i.disk,
+                    ))
+                })
+                .collect();
+            let archive_entries = archive.as_ref().map(|a| a.entries()).unwrap_or(&[]);
+            build_tree_with(
+                archive_entries
+                    .iter()
+                    .map(|e| (e, None))
+                    .chain(pending_entries.iter().map(|(e, d)| (e, Some(d.clone())))),
+            )
+        };
+        if let Some(ov) = self.ivars().outline.get() {
+            if let Some(d) = ov.sortDescriptors().firstObject() {
+                let key = d.key().map(|k| k.to_string()).unwrap_or_default();
+                if let Some(k) = SortKey::from_identifier(&key) {
+                    sort_tree(&mut roots, k, d.ascending());
+                }
+            }
+            // Remember which top-level folders were expanded, by name.
+            let expanded: Vec<String> = self
+                .ivars()
+                .roots
+                .borrow()
+                .iter()
+                .filter(|n| {
+                    let item: &AnyObject = n;
+                    unsafe { ov.isItemExpanded(Some(item)) }
+                })
+                .map(|n| n.data().name.clone())
+                .collect();
+            *self.ivars().roots.borrow_mut() = roots;
+            ov.reloadData();
+            let roots = self.ivars().roots.borrow();
+            for n in roots.iter().filter(|n| expanded.contains(&n.data().name)) {
+                let item: &AnyObject = n;
+                unsafe { ov.expandItem(Some(item)) };
+            }
+        } else {
+            *self.ivars().roots.borrow_mut() = roots;
+        }
+    }
+
     fn set_busy(&self, busy: bool, text: &str) {
         if let Some(s) = self.ivars().spinner.get() {
             unsafe {
@@ -455,33 +725,54 @@ impl Document {
             return;
         };
         let archive = self.ivars().archive.borrow();
-        let Some(archive) = archive.as_ref() else {
-            return;
-        };
-        let entries = archive.entries();
-        let files = entries.iter().filter(|e| !e.is_dir()).count();
-        let total: Option<u64> = entries.iter().filter(|e| !e.is_dir()).map(|e| e.size).sum();
-        let packed: Option<u64> = entries
-            .iter()
-            .filter(|e| !e.is_dir())
-            .map(|e| e.packed_size)
-            .sum();
-        let mut s = format!(
-            "{} {}, {}",
-            files,
-            if files == 1 { "file" } else { "files" },
-            format_size(total)
-        );
-        if packed.is_some() {
-            s.push_str(&format!(" ({} packed)", format_size(packed)));
-        }
-        s.push_str(&format!(" · {}", archive.format().display_name()));
         let sel = self.selected_nodes();
+        let mut s;
+        if let Some(archive) = archive.as_ref() {
+            let entries = archive.entries();
+            let files = entries.iter().filter(|e| !e.is_dir()).count();
+            let total: Option<u64> = entries.iter().filter(|e| !e.is_dir()).map(|e| e.size).sum();
+            let packed: Option<u64> = entries
+                .iter()
+                .filter(|e| !e.is_dir())
+                .map(|e| e.packed_size)
+                .sum();
+            s = format!(
+                "{} {}, {}",
+                files,
+                if files == 1 { "file" } else { "files" },
+                format_size(total)
+            );
+            if packed.is_some() {
+                s.push_str(&format!(" ({} packed)", format_size(packed)));
+            }
+            s.push_str(&format!(" · {}", archive.format().display_name()));
+            if !archive.format().is_writable() {
+                s.push_str(" · read-only");
+            }
+            if archive.needs_password() && self.ivars().password.borrow().is_none() {
+                s.push_str(" · encrypted");
+            }
+        } else {
+            let pending = self.ivars().pending.borrow();
+            if pending.is_empty() {
+                s = "Drop files here or use Archive → Add Files…, then Save (⌘S).".into();
+            } else {
+                let total: u64 = self
+                    .ivars()
+                    .roots
+                    .borrow()
+                    .iter()
+                    .filter_map(|n| n.total_size())
+                    .sum();
+                s = format!(
+                    "{} item(s), {} — not saved yet (⌘S)",
+                    pending.len(),
+                    format_size(Some(total))
+                );
+            }
+        }
         if !sel.is_empty() {
             s.push_str(&format!(" · {} selected", sel.len()));
-        }
-        if archive.needs_password() && self.ivars().password.borrow().is_none() {
-            s.push_str(" · encrypted");
         }
         label.setStringValue(&ns(&s));
     }
@@ -518,10 +809,16 @@ impl Document {
         let cell: Retained<NSTableCellView> =
             match existing.and_then(|v| v.downcast::<NSTableCellView>().ok()) {
                 Some(c) => c,
-                None => make_cell_view(&ident, id == COL_NAME, id != COL_NAME, mtm),
+                None => {
+                    let me: &AnyObject = self;
+                    make_cell_view(&ident, id == COL_NAME, id != COL_NAME, me, mtm)
+                }
             };
         if let Some(tf) = unsafe { cell.textField() } {
             tf.setStringValue(&ns(&text));
+            if id == COL_NAME {
+                tf.setEditable(self.can_edit());
+            }
         }
         if id == COL_NAME {
             if let Some(iv) = unsafe { cell.imageView() } {
@@ -565,7 +862,7 @@ impl Document {
     // ---------------------------------------------------------- extract
 
     fn begin_extract(&self, all: bool) {
-        if self.ivars().job.get().is_some() {
+        if self.busy() {
             return;
         }
         let Some(archive) = self.ivars().archive.borrow().clone() else {
@@ -613,7 +910,7 @@ impl Document {
             .unwrap_or_else(|| default_extract_dir(&archive_path));
         panel.setDirectoryURL(Some(&path_to_url(&start)));
 
-        // Accessory: "Into a subfolder named after the archive" (only meaningful for extract-all).
+        // Accessory: "Into a subfolder named after the archive".
         let roots_len = self.ivars().roots.borrow().len();
         let checkbox = unsafe {
             NSButton::checkboxWithTitle_target_action(
@@ -683,24 +980,11 @@ impl Document {
             return;
         }
         let password = self.ivars().password.borrow().clone();
-        let cancel = Arc::new(Cancel::new());
-        *self.ivars().cancel.borrow_mut() = Some(cancel.clone());
-        self.ivars().job.set(Some(Job::Extract));
-        self.show_progress("Preparing…", None);
+        let cancel = self.start_job(Job::Extract, "Preparing…");
 
         let h = self.handle();
         spawn("zipper-extract", move || {
-            let progress_h = h.clone();
-            let last = std::sync::Mutex::new(Instant::now() - Duration::from_secs(1));
-            let progress = move |p: &Progress| {
-                let mut l = last.lock().unwrap();
-                if l.elapsed() < Duration::from_millis(80) {
-                    return;
-                }
-                *l = Instant::now();
-                let p = p.clone();
-                progress_h.on_main(move |doc, _| doc.update_progress(&p));
-            };
+            let progress = throttled_progress(h.clone());
             let conflict_h = h.clone();
             let on_conflict = move |path: &Path| -> ConflictDecision {
                 let shown = path.to_string_lossy().into_owned();
@@ -734,13 +1018,10 @@ impl Document {
         if self.ivars().closed.get() {
             return;
         }
-        self.hide_progress();
-        self.ivars().job.set(None);
-        *self.ivars().cancel.borrow_mut() = None;
+        self.end_job();
         match result {
             Ok(report) => {
                 let root = if into_subfolder {
-                    // archive-core puts everything under dest/<stem>; reveal that folder.
                     report
                         .written
                         .first()
@@ -791,7 +1072,13 @@ impl Document {
                         &format!(
                             "{} entries pointed outside the destination folder and were skipped for safety:\n{}",
                             report.skipped_unsafe.len(),
-                            report.skipped_unsafe.iter().take(10).map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n")
+                            report
+                                .skipped_unsafe
+                                .iter()
+                                .take(10)
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join("\n")
                         ),
                         false,
                         mtm,
@@ -848,7 +1135,12 @@ impl Document {
             }
             return;
         }
-        if self.ivars().job.get().is_some() {
+        // Not yet in an archive: open the file where it lives.
+        if let Some(disk) = &node.data().disk {
+            NSWorkspace::sharedWorkspace().openURL(&path_to_url(disk));
+            return;
+        }
+        if self.busy() {
             return;
         }
         let Some(archive) = self.ivars().archive.borrow().clone() else {
@@ -876,17 +1168,10 @@ impl Document {
             return;
         }
         let password = self.ivars().password.borrow().clone();
-        let cancel = Arc::new(Cancel::new());
-        *self.ivars().cancel.borrow_mut() = Some(cancel.clone());
-        self.ivars().job.set(Some(Job::OpenEntry));
-        self.show_progress(&format!("Opening {}…", node.data().name), None);
+        let cancel = self.start_job(Job::OpenEntry, &format!("Opening {}…", node.data().name));
         let h = self.handle();
         spawn("zipper-open-entry", move || {
-            let progress_h = h.clone();
-            let progress = move |p: &Progress| {
-                let p = p.clone();
-                progress_h.on_main(move |doc, _| doc.update_progress(&p));
-            };
+            let progress = throttled_progress(h.clone());
             let opts = ExtractOptions {
                 overwrite: Overwrite::Always(ConflictAction::Replace),
                 password,
@@ -905,9 +1190,7 @@ impl Document {
         if self.ivars().closed.get() {
             return;
         }
-        self.hide_progress();
-        self.ivars().job.set(None);
-        *self.ivars().cancel.borrow_mut() = None;
+        self.end_job();
         self.update_status();
         match result {
             Ok(target) => {
@@ -950,7 +1233,7 @@ impl Document {
     // ---------------------------------------------------------- test
 
     fn begin_test(&self) {
-        if self.ivars().job.get().is_some() {
+        if self.busy() {
             return;
         }
         let Some(archive) = self.ivars().archive.borrow().clone() else {
@@ -970,23 +1253,10 @@ impl Document {
             return;
         }
         let password = self.ivars().password.borrow().clone();
-        let cancel = Arc::new(Cancel::new());
-        *self.ivars().cancel.borrow_mut() = Some(cancel.clone());
-        self.ivars().job.set(Some(Job::Test));
-        self.show_progress("Testing…", None);
+        let cancel = self.start_job(Job::Test, "Testing…");
         let h = self.handle();
         spawn("zipper-test", move || {
-            let progress_h = h.clone();
-            let last = std::sync::Mutex::new(Instant::now() - Duration::from_secs(1));
-            let progress = move |p: &Progress| {
-                let mut l = last.lock().unwrap();
-                if l.elapsed() < Duration::from_millis(80) {
-                    return;
-                }
-                *l = Instant::now();
-                let p = p.clone();
-                progress_h.on_main(move |doc, _| doc.update_progress(&p));
-            };
+            let progress = throttled_progress(h.clone());
             let result = archive.test(password.as_deref(), &progress, &cancel);
             h.on_main(move |doc, mtm| doc.test_finished(result, mtm));
         });
@@ -996,9 +1266,7 @@ impl Document {
         if self.ivars().closed.get() {
             return;
         }
-        self.hide_progress();
-        self.ivars().job.set(None);
-        *self.ivars().cancel.borrow_mut() = None;
+        self.end_job();
         self.update_status();
         match result {
             Ok(()) => sheets::alert(
@@ -1032,7 +1300,649 @@ impl Document {
         }
     }
 
-    // ---------------------------------------------------------- progress sheet
+    // ---------------------------------------------------------- editing
+
+    /// Add files from disk, either to the pending list (new document) or
+    /// to the archive via a rewrite. `under` is the folder inside the
+    /// archive to place them in.
+    pub fn add_sources(&self, paths: Vec<PathBuf>, under: Option<PathBuf>) {
+        if !self.can_edit() || self.busy() {
+            return;
+        }
+        let sources: Vec<Source> = paths
+            .iter()
+            .filter_map(|p| {
+                let name = p.file_name()?.to_string_lossy().into_owned();
+                let name = match &under {
+                    Some(u) => format!("{}/{}", u.to_string_lossy(), name),
+                    None => name,
+                };
+                Some(Source {
+                    disk: p.clone(),
+                    name,
+                })
+            })
+            .collect();
+        if sources.is_empty() {
+            return;
+        }
+        if self.is_new() {
+            let mut pending = self.ivars().pending.borrow_mut();
+            for s in sources {
+                pending.retain(|p| p.name != s.name);
+                pending.push(s);
+            }
+            drop(pending);
+            self.rebuild_tree();
+            self.update_status();
+        } else {
+            self.run_modify(
+                Edit {
+                    add: sources,
+                    ..Default::default()
+                },
+                "Adding files…",
+            );
+        }
+    }
+
+    fn begin_add_files(&self) {
+        if !self.can_edit() || self.busy() {
+            return;
+        }
+        let mtm = self.mtm();
+        let panel = NSOpenPanel::openPanel(mtm);
+        panel.setCanChooseFiles(true);
+        panel.setCanChooseDirectories(true);
+        panel.setAllowsMultipleSelection(true);
+        panel.setPrompt(Some(&ns("Add")));
+        panel.setMessage(Some(&ns("Choose files or folders to add to the archive")));
+        // Add under the selected folder, if one is selected.
+        let under = self
+            .selected_nodes()
+            .first()
+            .map(|n| {
+                let d = n.data();
+                if d.is_dir {
+                    Some(d.path.clone())
+                } else {
+                    d.path
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map(Path::to_path_buf)
+                }
+            })
+            .unwrap_or(None);
+        let h = self.handle();
+        let panel_c = panel.clone();
+        let block = RcBlock::new(move |resp: NSModalResponse| {
+            if resp != NSModalResponseOK {
+                return;
+            }
+            let urls = panel_c.URLs();
+            let paths: Vec<PathBuf> = (0..urls.count())
+                .filter_map(|i| url_to_path(&urls.objectAtIndex(i)))
+                .collect();
+            let under = under.clone();
+            h.on_main(move |doc, _| doc.add_sources(paths, under));
+        });
+        panel.beginSheetModalForWindow_completionHandler(self.window(), &block);
+    }
+
+    fn begin_delete(&self) {
+        if !self.can_edit() || self.busy() {
+            return;
+        }
+        let nodes = self.selected_nodes();
+        if nodes.is_empty() {
+            return;
+        }
+        let paths: Vec<PathBuf> = nodes.iter().map(|n| n.data().path.clone()).collect();
+        let what = if paths.len() == 1 {
+            format!("“{}”", nodes[0].data().name)
+        } else {
+            format!("{} items", paths.len())
+        };
+        let h = self.handle();
+        let msg = if self.is_new() {
+            "They are only removed from this new archive, not from disk.".to_string()
+        } else {
+            format!(
+                "The archive “{}” will be rewritten without them.",
+                self.archive_name()
+            )
+        };
+        sheets::confirm(
+            self.window(),
+            &format!("Delete {what}?"),
+            &msg,
+            "Delete",
+            self.mtm(),
+            move |yes| {
+                if !yes {
+                    return;
+                }
+                let paths = paths.clone();
+                h.on_main(move |doc, _| doc.apply_delete(paths));
+            },
+        );
+    }
+
+    fn apply_delete(&self, paths: Vec<PathBuf>) {
+        if self.is_new() {
+            {
+                let mut pending = self.ivars().pending.borrow_mut();
+                pending.retain(|s| {
+                    let sp = Path::new(&s.name);
+                    !paths.iter().any(|p| sp == p || sp.starts_with(p))
+                });
+            }
+            self.rebuild_tree();
+            self.update_status();
+        } else {
+            self.run_modify(
+                Edit {
+                    remove: paths,
+                    ..Default::default()
+                },
+                "Deleting…",
+            );
+        }
+    }
+
+    fn begin_rename(&self) {
+        if !self.can_edit() || self.busy() {
+            return;
+        }
+        let Some(ov) = self.ivars().outline.get() else {
+            return;
+        };
+        let row = ov.selectedRow();
+        if row < 0 {
+            return;
+        }
+        unsafe { ov.editColumn_row_withEvent_select(0, row, None, true) };
+    }
+
+    /// Called when the Name cell's text field ends editing.
+    fn rename_from_field(&self, tf: &NSTextField) {
+        let Some(ov) = self.ivars().outline.get() else {
+            return;
+        };
+        let row = ov.rowForView(tf);
+        if row < 0 {
+            return;
+        }
+        let Some(item) = ov.itemAtRow(row) else {
+            return;
+        };
+        let Some(node) = item.downcast_ref::<Node>() else {
+            return;
+        };
+        let old_path = node.data().path.clone();
+        let old_name = node.data().name.clone();
+        let new_name = tf.stringValue().to_string();
+        let new_name = new_name.trim().to_string();
+        if new_name.is_empty() || new_name == old_name {
+            tf.setStringValue(&ns(&old_name));
+            return;
+        }
+        if new_name.contains('/') || new_name == "." || new_name == ".." {
+            tf.setStringValue(&ns(&old_name));
+            sheets::alert(
+                Some(self.window()),
+                "Invalid name",
+                "Names cannot contain “/”.",
+                false,
+                self.mtm(),
+            );
+            return;
+        }
+        let new_path = old_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join(&new_name))
+            .unwrap_or_else(|| PathBuf::from(&new_name));
+        if self.is_new() {
+            {
+                let mut pending = self.ivars().pending.borrow_mut();
+                let old_s = old_path.to_string_lossy().into_owned();
+                let new_s = new_path.to_string_lossy().into_owned();
+                for s in pending.iter_mut() {
+                    if s.name == old_s {
+                        s.name = new_s.clone();
+                    } else if let Some(rest) = s.name.strip_prefix(&format!("{old_s}/")) {
+                        s.name = format!("{new_s}/{rest}");
+                    }
+                }
+            }
+            self.rebuild_tree();
+            self.update_status();
+        } else {
+            self.run_modify(
+                Edit {
+                    rename: vec![(old_path, new_path)],
+                    ..Default::default()
+                },
+                "Renaming…",
+            );
+        }
+    }
+
+    /// Rewrite the archive with `edit`, then reload it.
+    fn run_modify(&self, edit: Edit, text: &str) {
+        let Some(path) = self.path() else { return };
+        let Some(archive) = self.ivars().archive.borrow().clone() else {
+            return;
+        };
+        if archive.needs_password() && self.ivars().password.borrow().is_none() {
+            let name = self.archive_name();
+            let h = self.handle();
+            let text = text.to_string();
+            sheets::ask_password(self.window(), &name, false, self.mtm(), move |pw| {
+                let (edit, text) = (edit.clone(), text.clone());
+                h.on_main(move |doc, _| {
+                    if let Some(pw) = pw {
+                        *doc.ivars().password.borrow_mut() = Some(pw);
+                        doc.run_modify(edit, &text);
+                    }
+                });
+            });
+            return;
+        }
+        let password = self.ivars().password.borrow().clone();
+        let cancel = self.start_job(Job::Modify, text);
+        let h = self.handle();
+        spawn("zipper-modify", move || {
+            let progress = throttled_progress(h.clone());
+            let opts = WriteOptions {
+                format: archive.format(),
+                password,
+                ..Default::default()
+            };
+            let result = write::modify(&path, &edit, &opts, &progress, &cancel);
+            h.on_main(move |doc, mtm| doc.modify_finished(result, mtm));
+        });
+    }
+
+    fn modify_finished(&self, result: archive_core::Result<PathBuf>, mtm: MainThreadMarker) {
+        if self.ivars().closed.get() {
+            return;
+        }
+        self.end_job();
+        match result {
+            Ok(_) => {
+                // The archive on disk changed; drop any temp copies and reload.
+                self.remove_temp_dir();
+                let pw = self.ivars().password.borrow().clone();
+                self.load(pw);
+            }
+            Err(Error::Cancelled) => self.update_status(),
+            Err(e) => {
+                self.update_status();
+                sheets::alert(
+                    Some(self.window()),
+                    "Could not change the archive",
+                    &e.to_string(),
+                    true,
+                    mtm,
+                );
+            }
+        }
+    }
+
+    // ---------------------------------------------------------- save (new document)
+
+    fn begin_save(&self) {
+        if !self.is_new() || self.busy() {
+            return;
+        }
+        let pending = self.ivars().pending.borrow().clone();
+        if pending.is_empty() {
+            return;
+        }
+        let mtm = self.mtm();
+        let panel = NSSavePanel::savePanel(mtm);
+        panel.setCanCreateDirectories(true);
+        panel.setAllowsOtherFileTypes(true);
+        panel.setExtensionHidden(false);
+        panel.setMessage(Some(&ns("Save the new archive")));
+        let stem = Path::new(&pending[0].name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Archive".into());
+        let stem = if pending.len() == 1 {
+            stem
+        } else {
+            "Archive".to_string()
+        };
+        panel.setNameFieldStringValue(&ns(&format!("{stem}.zip")));
+        if let Some(dir) = pending[0].disk.parent() {
+            panel.setDirectoryURL(Some(&path_to_url(dir)));
+        }
+        let acc = self.build_save_accessory(mtm);
+        panel.setAccessoryView(Some(&acc));
+
+        let h = self.handle();
+        let panel_c = panel.clone();
+        let block = RcBlock::new(move |resp: NSModalResponse| {
+            if resp != NSModalResponseOK {
+                return;
+            }
+            let Some(url) = panel_c.URL() else { return };
+            let Some(dest) = url_to_path(&url) else {
+                return;
+            };
+            h.on_main(move |doc, _| doc.run_save(dest));
+        });
+        panel.beginSheetModalForWindow_completionHandler(self.window(), &block);
+    }
+
+    fn build_save_accessory(&self, mtm: MainThreadMarker) -> Retained<NSView> {
+        let me: &AnyObject = self;
+        let view = unsafe {
+            NSView::initWithFrame(
+                NSView::alloc(mtm),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 124.0)),
+            )
+        };
+        let label = |text: &str, y: f64| {
+            let l = NSTextField::labelWithString(&ns(text), mtm);
+            l.setFrame(NSRect::new(NSPoint::new(20.0, y), NSSize::new(110.0, 20.0)));
+            l.setAlignment(objc2_app_kit::NSTextAlignment::Right);
+            view.addSubview(&l);
+        };
+        let popup = |y: f64, items: &[&str]| {
+            let p = unsafe {
+                NSPopUpButton::initWithFrame_pullsDown(
+                    NSPopUpButton::alloc(mtm),
+                    NSRect::new(NSPoint::new(140.0, y - 3.0), NSSize::new(180.0, 26.0)),
+                    false,
+                )
+            };
+            let titles: Vec<Retained<NSString>> = items.iter().map(|s| ns(s)).collect();
+            p.addItemsWithTitles(&NSArray::from_retained_slice(&titles));
+            view.addSubview(&p);
+            p
+        };
+        label("Format:", 94.0);
+        let format = popup(94.0, &["zip", "7z"]);
+        unsafe {
+            format.setTarget(Some(me));
+            format.setAction(Some(sel!(saveFormatChanged:)));
+        }
+        label("Compression:", 66.0);
+        let level = popup(66.0, &["Store (no compression)", "Fast", "Normal", "Best"]);
+        level.selectItemAtIndex(2);
+        label("Password:", 38.0);
+        let password = unsafe {
+            NSSecureTextField::initWithFrame(
+                NSSecureTextField::alloc(mtm),
+                NSRect::new(NSPoint::new(140.0, 36.0), NSSize::new(180.0, 24.0)),
+            )
+        };
+        password.setPlaceholderString(Some(&ns("none")));
+        view.addSubview(&password);
+        label("Split (7z):", 10.0);
+        let split = popup(
+            10.0,
+            &[
+                "Don’t split",
+                "100 MB volumes",
+                "1 GB volumes",
+                "4 GB volumes",
+            ],
+        );
+        *self.ivars().save_ui.borrow_mut() = Some(SaveUi {
+            format,
+            level,
+            password,
+            split,
+        });
+        self.sync_save_ui();
+        view
+    }
+
+    fn sync_save_ui(&self) {
+        let ui = self.ivars().save_ui.borrow();
+        if let Some(ui) = ui.as_ref() {
+            let is_7z = ui.format.indexOfSelectedItem() == 1;
+            ui.split.setEnabled(is_7z);
+        }
+    }
+
+    fn save_options(&self) -> WriteOptions {
+        let ui = self.ivars().save_ui.borrow();
+        let Some(ui) = ui.as_ref() else {
+            return WriteOptions::default();
+        };
+        let format = if ui.format.indexOfSelectedItem() == 1 {
+            Format::SevenZ
+        } else {
+            Format::Zip
+        };
+        let level = match ui.level.indexOfSelectedItem() {
+            0 => 0,
+            1 => 1,
+            3 => 9,
+            _ => 6,
+        };
+        let pw = ui.password.stringValue().to_string();
+        let volume_size = if format == Format::SevenZ {
+            match ui.split.indexOfSelectedItem() {
+                1 => Some(100 * 1_000_000),
+                2 => Some(1_000_000_000),
+                3 => Some(4_000_000_000),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        WriteOptions {
+            format,
+            level,
+            password: if pw.is_empty() { None } else { Some(pw) },
+            solid: false,
+            encrypt_header: true,
+            volume_size,
+        }
+    }
+
+    fn run_save(&self, mut dest: PathBuf) {
+        let opts = self.save_options();
+        // Make the extension match the chosen format.
+        let ext = opts.format.extension();
+        let has_ext = dest
+            .extension()
+            .map(|e| e.to_string_lossy().eq_ignore_ascii_case(ext))
+            .unwrap_or(false);
+        if !has_ext {
+            let name = dest
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Archive".into());
+            let stem = match name.rsplit_once('.') {
+                Some((s, e)) if e.eq_ignore_ascii_case("zip") || e.eq_ignore_ascii_case("7z") => {
+                    s.to_string()
+                }
+                _ => name,
+            };
+            dest.set_file_name(format!("{stem}.{ext}"));
+        }
+        let sources = self.ivars().pending.borrow().clone();
+        let cancel = self.start_job(Job::Save, "Saving…");
+        let h = self.handle();
+        spawn("zipper-save", move || {
+            let progress = throttled_progress(h.clone());
+            let result = write::create_from(&dest, &sources, &opts, &progress, &cancel);
+            let password = opts.password.clone();
+            h.on_main(move |doc, mtm| doc.save_finished(result, password, mtm));
+        });
+    }
+
+    fn save_finished(
+        &self,
+        result: archive_core::Result<PathBuf>,
+        password: Option<String>,
+        mtm: MainThreadMarker,
+    ) {
+        if self.ivars().closed.get() {
+            return;
+        }
+        self.end_job();
+        match result {
+            Ok(saved) => {
+                // The document now is that archive.
+                self.ivars().pending.borrow_mut().clear();
+                *self.ivars().path.borrow_mut() = Some(saved.clone());
+                *self.ivars().password.borrow_mut() = password.clone();
+                NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(
+                    &NSArray::from_retained_slice(&[path_to_url(&saved)]),
+                );
+                self.load(password);
+            }
+            Err(Error::Cancelled) => self.update_status(),
+            Err(e) => {
+                self.update_status();
+                sheets::alert(
+                    Some(self.window()),
+                    "Could not save the archive",
+                    &e.to_string(),
+                    true,
+                    mtm,
+                );
+            }
+        }
+    }
+
+    // ---------------------------------------------------------- drag out
+
+    fn pasteboard_writer_for(
+        &self,
+        item: &AnyObject,
+    ) -> Option<Retained<ProtocolObject<dyn NSPasteboardWriting>>> {
+        let node = item.downcast_ref::<Node>()?;
+        let d = node.data();
+        // Not in an archive yet: Finder can copy the real file.
+        if let Some(disk) = &d.disk {
+            let url = path_to_url(disk);
+            return Some(ProtocolObject::from_retained(url));
+        }
+        self.ivars().archive.borrow().as_ref()?;
+        let file_type = if d.is_dir {
+            "public.folder"
+        } else {
+            "public.data"
+        };
+        let provider = NSFilePromiseProvider::initWithFileType_delegate(
+            NSFilePromiseProvider::alloc(),
+            &ns(file_type),
+            ProtocolObject::from_ref(self),
+        );
+        let info: Retained<NSString> = ns(&d.path.to_string_lossy());
+        unsafe { provider.setUserInfo(Some(&info)) };
+        Some(ProtocolObject::from_retained(provider))
+    }
+
+    fn write_promise(
+        &self,
+        provider: &NSFilePromiseProvider,
+        url: &NSURL,
+        handler: &block2::DynBlock<dyn Fn(*mut NSError)>,
+    ) {
+        let entry_path = promise_path(provider);
+        let Some(target) = url_to_path(url) else {
+            handler.call((std::ptr::null_mut(),));
+            return;
+        };
+        let Some(archive) = self.ivars().archive.borrow().clone() else {
+            handler.call((std::ptr::null_mut(),));
+            return;
+        };
+        let id = self.ivars().next_promise.get();
+        self.ivars().next_promise.set(id + 1);
+        self.ivars()
+            .promises
+            .borrow_mut()
+            .insert(id, handler.copy());
+
+        let password = self.ivars().password.borrow().clone();
+        // Extract <entry> so that it lands exactly at <target>: strip the
+        // entry's parent and write into target's parent folder.
+        let dest = target
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let strip = entry_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+        let cancel = Arc::new(Cancel::new());
+        if self.ivars().job.get().is_none() {
+            self.start_job_with(Job::Promise, "Copying to Finder…", cancel.clone());
+        }
+        let h = self.handle();
+        spawn("zipper-promise", move || {
+            let progress = throttled_progress(h.clone());
+            let opts = ExtractOptions {
+                overwrite: Overwrite::Always(ConflictAction::Replace),
+                password,
+                into_subfolder: false,
+                preserve_mtime: true,
+                strip_prefix: strip,
+            };
+            let result = archive.extract(&[entry_path], &dest, &opts, &progress, &cancel);
+            h.on_main(move |doc, mtm| doc.promise_finished(id, result, mtm));
+        });
+    }
+
+    fn promise_finished(
+        &self,
+        id: u64,
+        result: archive_core::Result<ExtractReport>,
+        mtm: MainThreadMarker,
+    ) {
+        let block = self.ivars().promises.borrow_mut().remove(&id);
+        if self.ivars().job.get() == Some(Job::Promise) && self.ivars().promises.borrow().is_empty()
+        {
+            self.end_job();
+            self.update_status();
+        }
+        if let Some(b) = block {
+            b.call((std::ptr::null_mut(),));
+        }
+        if let Err(e) = result {
+            if !matches!(e, Error::Cancelled) && !self.ivars().closed.get() {
+                sheets::alert(
+                    Some(self.window()),
+                    "Could not copy file",
+                    &e.to_string(),
+                    true,
+                    mtm,
+                );
+            }
+        }
+    }
+
+    // ---------------------------------------------------------- jobs & progress sheet
+
+    fn start_job(&self, job: Job, text: &str) -> Arc<Cancel> {
+        let cancel = Arc::new(Cancel::new());
+        self.start_job_with(job, text, cancel.clone());
+        cancel
+    }
+
+    fn start_job_with(&self, job: Job, text: &str, cancel: Arc<Cancel>) {
+        *self.ivars().cancel.borrow_mut() = Some(cancel);
+        self.ivars().job.set(Some(job));
+        self.show_progress(text, None);
+    }
+
+    fn end_job(&self) {
+        self.hide_progress();
+        self.ivars().job.set(None);
+        *self.ivars().cancel.borrow_mut() = None;
+    }
 
     fn progress_ui(&self) -> &ProgressUi {
         self.ivars().progress.get_or_init(|| {
@@ -1089,7 +1999,6 @@ impl Document {
                 label,
                 bar,
                 shown: Cell::new(false),
-                shown_at: Cell::new(None),
             }
         })
     }
@@ -1109,7 +2018,6 @@ impl Document {
         }
         if !ui.shown.get() {
             ui.shown.set(true);
-            ui.shown_at.set(Some(Instant::now()));
             self.window().beginSheet_completionHandler(&ui.panel, None);
         }
         self.set_busy(true, text);
@@ -1177,6 +2085,17 @@ impl Document {
         if let Some(c) = self.ivars().cancel.borrow().as_ref() {
             c.cancel();
         }
+        // Answer any dangling drag promises so Finder does not wait forever.
+        let promises: Vec<PromiseBlock> = self
+            .ivars()
+            .promises
+            .borrow_mut()
+            .drain()
+            .map(|(_, b)| b)
+            .collect();
+        for b in promises {
+            b.call((std::ptr::null_mut(),));
+        }
         self.remove_temp_dir();
         crate::app::forget_document(self);
     }
@@ -1195,6 +2114,28 @@ impl Document {
 }
 
 // ------------------------------------------------------------------ helpers
+
+/// Progress callback for worker threads: forwards at most ~12 updates per
+/// second to the document on the main thread.
+fn throttled_progress(h: MainHandle<Document>) -> impl Fn(&Progress) + Sync {
+    let last = std::sync::Mutex::new(Instant::now() - Duration::from_secs(1));
+    move |p: &Progress| {
+        let mut l = last.lock().unwrap();
+        if l.elapsed() < Duration::from_millis(80) {
+            return;
+        }
+        *l = Instant::now();
+        let p = p.clone();
+        h.on_main(move |doc, _| doc.update_progress(&p));
+    }
+}
+
+fn promise_path(provider: &NSFilePromiseProvider) -> PathBuf {
+    unsafe { provider.userInfo() }
+        .and_then(|o| o.downcast::<NSString>().ok())
+        .map(|s| PathBuf::from(s.to_string()))
+        .unwrap_or_default()
+}
 
 fn make_column(
     id: &str,
@@ -1221,6 +2162,7 @@ fn make_cell_view(
     ident: &NSString,
     with_icon: bool,
     right_align: bool,
+    target: &AnyObject,
     mtm: MainThreadMarker,
 ) -> Retained<NSTableCellView> {
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(200.0, 20.0));
@@ -1235,20 +2177,23 @@ fn make_cell_view(
             NSPoint::new(2.0, 1.0),
             NSSize::new(196.0, 18.0),
         ));
-        tf.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
     } else if with_icon {
         tf.setFrame(NSRect::new(
             NSPoint::new(22.0, 1.0),
             NSSize::new(176.0, 18.0),
         ));
-        tf.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+        // Inline rename: committing the edit sends renameCommitted:.
+        unsafe {
+            tf.setTarget(Some(target));
+            tf.setAction(Some(sel!(renameCommitted:)));
+        }
     } else {
         tf.setFrame(NSRect::new(
             NSPoint::new(2.0, 1.0),
             NSSize::new(196.0, 18.0),
         ));
-        tf.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
     }
+    tf.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
     cell.addSubview(&tf);
     unsafe { cell.setTextField(Some(&tf)) };
     if with_icon {
@@ -1266,8 +2211,7 @@ fn make_cell_view(
 }
 
 /// Folder / document icons as SF Symbols. This deliberately avoids the
-/// deprecated `-[NSWorkspace iconForFileType:]` (Icon Services), which is a
-/// suspect in a HIServices crash seen on macOS 26/27.
+/// deprecated `-[NSWorkspace iconForFileType:]` (Icon Services).
 fn icon_for(name: &str, is_dir: bool) -> Option<Retained<objc2_app_kit::NSImage>> {
     let symbol = if is_dir {
         "folder.fill"
@@ -1296,3 +2240,6 @@ fn icon_for(name: &str, is_dir: bool) -> Option<Retained<objc2_app_kit::NSImage>
         )
     }
 }
+
+#[allow(dead_code)]
+fn _kinds(_: EntryKind) {}

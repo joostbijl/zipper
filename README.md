@@ -6,7 +6,7 @@ inside it, or extract exactly the files you want to exactly the folder you
 want. See [SPEC.md](SPEC.md) for the full brief and [TESTING.md](TESTING.md)
 for the acceptance checklist.
 
-Status: **Phase 1 written, awaiting first run on a Mac** (open, browse, extract, test).
+Status: **Phase 1 working on macOS; Phase 2 written, awaiting first run** (drag out, create, add, delete, rename).
 
 ## Formats
 

@@ -47,6 +47,29 @@ pub fn open_path(path: PathBuf, mtm: MainThreadMarker) {
     close_empty_window();
 }
 
+/// Finder-style: archives open, anything else becomes one new archive
+/// (SPEC §4, item 11).
+pub fn open_paths(paths: Vec<PathBuf>, mtm: MainThreadMarker) {
+    let mut sources = Vec::new();
+    for p in paths {
+        if p.is_file() && archive_core::detect_format(&p).is_ok() {
+            open_path(p, mtm);
+        } else if p.exists() {
+            sources.push(p);
+        }
+    }
+    if !sources.is_empty() {
+        new_document(sources, mtm);
+    }
+}
+
+/// A new, unsaved archive window.
+pub fn new_document(sources: Vec<PathBuf>, mtm: MainThreadMarker) {
+    let doc = Document::new_untitled(sources, mtm);
+    DOCUMENTS.with(|d| d.borrow_mut().push(doc));
+    close_empty_window();
+}
+
 pub fn forget_document(doc: &Document) {
     DOCUMENTS.with(|d| d.borrow_mut().retain(|x| !std::ptr::eq(&**x, doc)));
 }
@@ -65,7 +88,9 @@ pub fn show_open_panel(mtm: MainThreadMarker) {
     panel.setCanChooseFiles(true);
     panel.setCanChooseDirectories(false);
     panel.setAllowsMultipleSelection(true);
-    panel.setMessage(Some(&ns("Choose an archive to open")));
+    panel.setMessage(Some(&ns(
+        "Choose an archive to open (other files start a new archive)",
+    )));
     let panel_c = panel.clone();
     let block = RcBlock::new(move |resp: NSModalResponse| {
         if resp != NSModalResponseOK {
@@ -80,9 +105,7 @@ pub fn show_open_panel(mtm: MainThreadMarker) {
         dispatch2::DispatchQueue::main().exec_async(move || {
             // SAFETY: the main queue runs on the main thread.
             let mtm = unsafe { MainThreadMarker::new_unchecked() };
-            for p in paths {
-                open_path(p, mtm);
-            }
+            open_paths(paths, mtm);
         });
     });
     unsafe { panel.beginWithCompletionHandler(&block) };
@@ -121,11 +144,10 @@ define_class!(
         #[unsafe(method(application:openURLs:))]
         fn open_urls(&self, _app: &NSApplication, urls: &NSArray<NSURL>) {
             let mtm = self.mtm();
-            for i in 0..urls.count() {
-                if let Some(p) = url_to_path(&urls.objectAtIndex(i)) {
-                    open_path(p, mtm);
-                }
-            }
+            let paths: Vec<PathBuf> = (0..urls.count())
+                .filter_map(|i| url_to_path(&urls.objectAtIndex(i)))
+                .collect();
+            open_paths(paths, mtm);
         }
 
         #[unsafe(method(applicationShouldOpenUntitledFile:))]
@@ -169,9 +191,9 @@ define_class!(
             show_open_panel(self.mtm());
         }
 
-        #[unsafe(method(newEmptyWindow:))]
-        fn new_empty_window(&self, _sender: Option<&AnyObject>) {
-            show_empty_window(self.mtm());
+        #[unsafe(method(newDocument:))]
+        fn new_document_action(&self, _sender: Option<&AnyObject>) {
+            new_document(Vec::new(), self.mtm());
         }
     }
 );
@@ -233,10 +255,11 @@ fn build_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     // File
     let file_item = item("File", None, "", mtm);
     let file_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("File"));
+    file_menu.addItem(&item("New Archive", Some(sel!(newDocument:)), "n", mtm));
     file_menu.addItem(&item("Open…", Some(sel!(openDocument:)), "o", mtm));
-    file_menu.addItem(&item("New Window", Some(sel!(newEmptyWindow:)), "n", mtm));
     file_menu.addItem(&NSMenuItem::separatorItem(mtm));
     file_menu.addItem(&item("Close", Some(sel!(performClose:)), "w", mtm));
+    file_menu.addItem(&item("Save", Some(sel!(saveDocument:)), "s", mtm));
     file_item.setSubmenu(Some(&file_menu));
     main.addItem(&file_item);
 
@@ -247,12 +270,24 @@ fn build_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     edit_menu.addItem(&item("Copy", Some(sel!(copy:)), "c", mtm));
     edit_menu.addItem(&item("Paste", Some(sel!(paste:)), "v", mtm));
     edit_menu.addItem(&item("Select All", Some(sel!(selectAll:)), "a", mtm));
+    edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let rename = item("Rename", Some(sel!(renameSelected:)), "r", mtm);
+    rename
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
+    edit_menu.addItem(&rename);
+    let delete = item("Delete", Some(sel!(deleteSelected:)), "\u{8}", mtm);
+    delete.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+    edit_menu.addItem(&delete);
     edit_item.setSubmenu(Some(&edit_menu));
     main.addItem(&edit_item);
 
     // Archive
     let arch_item = item("Archive", None, "", mtm);
     let arch_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Archive"));
+    let add = item("Add Files…", Some(sel!(addFiles:)), "a", mtm);
+    add.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
+    arch_menu.addItem(&add);
+    arch_menu.addItem(&NSMenuItem::separatorItem(mtm));
     arch_menu.addItem(&item("Extract…", Some(sel!(extractSelected:)), "e", mtm));
     let extract_all = item("Extract All…", Some(sel!(extractAll:)), "e", mtm);
     extract_all
@@ -317,9 +352,7 @@ define_class!(
                 return false.into();
             }
             let mtm = self.mtm();
-            for p in paths {
-                open_path(p, mtm);
-            }
+            open_paths(paths, mtm);
             true.into()
         }
     }
@@ -335,7 +368,7 @@ impl DropView {
     }
 }
 
-fn dragged_paths(info: &ProtocolObject<dyn NSDraggingInfo>) -> Vec<PathBuf> {
+pub fn dragged_paths(info: &ProtocolObject<dyn NSDraggingInfo>) -> Vec<PathBuf> {
     let pb = unsafe { info.draggingPasteboard() };
     let Some(list) = pb.propertyListForType(unsafe { NSFilenamesPboardType }) else {
         return vec![];
@@ -348,7 +381,7 @@ fn dragged_paths(info: &ProtocolObject<dyn NSDraggingInfo>) -> Vec<PathBuf> {
         let obj = arr.objectAtIndex(i);
         if let Some(s) = obj.downcast_ref::<NSString>() {
             let p = PathBuf::from(s.to_string());
-            if p.is_file() {
+            if p.exists() {
                 out.push(p);
             }
         }
@@ -412,7 +445,7 @@ pub fn show_empty_window(mtm: MainThreadMarker) {
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
     let label = NSTextField::wrappingLabelWithString(
-        &ns("Drop an archive here to open it,\nor choose File → Open… (⌘O)."),
+        &ns("Drop an archive here to open it, or files to create one.\nFile → Open… (⌘O) · File → New Archive (⌘N)"),
         mtm,
     );
     label.setAlignment(NSTextAlignment::Center);

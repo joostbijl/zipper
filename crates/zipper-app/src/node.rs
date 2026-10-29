@@ -23,6 +23,9 @@ pub struct NodeData {
     pub modified: Option<SystemTime>,
     #[allow(dead_code)] // shown in the UI in Phase 3
     pub encrypted: bool,
+    /// For items not yet in an archive (a new, unsaved document): where the
+    /// data lives on disk.
+    pub disk: Option<PathBuf>,
     pub children: RefCell<Vec<Retained<Node>>>,
 }
 
@@ -90,7 +93,15 @@ impl SortKey {
 /// Build the tree from a flat entry list. Directories that only exist
 /// implicitly (a `a/b/c.txt` entry without an `a/` or `a/b/` entry) are
 /// created on the fly.
+#[allow(dead_code)]
 pub fn build_tree(entries: &[Entry]) -> Vec<Retained<Node>> {
+    build_tree_with(entries.iter().map(|e| (e, None)))
+}
+
+/// Like [`build_tree`], with an optional on-disk source per entry.
+pub fn build_tree_with<'a>(
+    items: impl Iterator<Item = (&'a Entry, Option<PathBuf>)>,
+) -> Vec<Retained<Node>> {
     #[derive(Default)]
     struct Tmp {
         is_dir: bool,
@@ -99,6 +110,7 @@ pub fn build_tree(entries: &[Entry]) -> Vec<Retained<Node>> {
         modified: Option<SystemTime>,
         encrypted: bool,
         explicit: bool,
+        disk: Option<PathBuf>,
         children: BTreeMap<String, Tmp>,
     }
 
@@ -106,7 +118,7 @@ pub fn build_tree(entries: &[Entry]) -> Vec<Retained<Node>> {
         is_dir: true,
         ..Default::default()
     };
-    for e in entries {
+    for (e, disk) in items {
         let comps: Vec<String> = e
             .path
             .components()
@@ -129,6 +141,7 @@ pub fn build_tree(entries: &[Entry]) -> Vec<Retained<Node>> {
                 node.packed = e.packed_size;
                 node.modified = e.modified;
                 node.encrypted = e.encrypted;
+                node.disk = disk.clone();
             } else {
                 node.is_dir = true;
             }
@@ -151,6 +164,7 @@ pub fn build_tree(entries: &[Entry]) -> Vec<Retained<Node>> {
             packed: t.packed,
             modified: t.modified,
             encrypted: t.encrypted,
+            disk: t.disk,
             children: RefCell::new(children),
         })
     }
