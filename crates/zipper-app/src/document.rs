@@ -240,9 +240,6 @@ impl Document {
         };
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(&ns(&self.archive_name()));
-        if let Some(p) = self.path() {
-            unsafe { window.setRepresentedURL(Some(&path_to_url(&p))) };
-        }
         unsafe { window.setContentMinSize(NSSize::new(420.0, 240.0)) };
         window.setFrameAutosaveName(ns_string!("ZipperDocumentWindow"));
         window.setDelegate(Some(ProtocolObject::from_ref(self)));
@@ -402,6 +399,9 @@ impl Document {
                 if let Some(b) = self.ivars().extract_button.get() {
                     b.setEnabled(true);
                 }
+                if let Some(p) = self.path() {
+                    unsafe { self.window().setRepresentedURL(Some(&path_to_url(&p))) };
+                }
                 self.update_status();
             }
             Err(Error::PasswordRequired) | Err(Error::WrongPassword) => {
@@ -525,7 +525,7 @@ impl Document {
         }
         if id == COL_NAME {
             if let Some(iv) = unsafe { cell.imageView() } {
-                iv.setImage(Some(&icon_for(&d.name, d.is_dir)));
+                iv.setImage(icon_for(&d.name, d.is_dir).as_deref());
             }
         }
         Some(Retained::into_super(cell))
@@ -1265,19 +1265,34 @@ fn make_cell_view(
     cell
 }
 
-#[allow(deprecated)]
-fn icon_for(name: &str, is_dir: bool) -> Retained<objc2_app_kit::NSImage> {
-    let ws = NSWorkspace::sharedWorkspace();
-    if is_dir {
-        return ws.iconForFileType(ns_string!("public.folder"));
-    }
-    let ext = Path::new(name)
-        .extension()
-        .map(|e| e.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if ext.is_empty() {
-        ws.iconForFileType(ns_string!("public.data"))
+/// Folder / document icons as SF Symbols. This deliberately avoids the
+/// deprecated `-[NSWorkspace iconForFileType:]` (Icon Services), which is a
+/// suspect in a HIServices crash seen on macOS 26/27.
+fn icon_for(name: &str, is_dir: bool) -> Option<Retained<objc2_app_kit::NSImage>> {
+    let symbol = if is_dir {
+        "folder.fill"
     } else {
-        ws.iconForFileType(&ns(&ext))
+        let ext = Path::new(name)
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "png" | "jpg" | "jpeg" | "gif" | "heic" | "tif" | "tiff" | "bmp" | "webp" | "svg" => {
+                "photo"
+            }
+            "pdf" => "doc.richtext",
+            "txt" | "md" | "log" | "csv" | "json" | "xml" | "yaml" | "yml" | "toml" => "doc.text",
+            "zip" | "7z" | "tar" | "gz" | "xz" | "bz2" | "zst" | "rar" => "doc.zipper",
+            "mp3" | "wav" | "flac" | "m4a" | "aac" => "music.note",
+            "mp4" | "mov" | "mkv" | "avi" => "film",
+            "app" | "exe" | "dmg" | "pkg" => "shippingbox",
+            _ => "doc",
+        }
+    };
+    unsafe {
+        objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &ns(symbol),
+            None,
+        )
     }
 }
