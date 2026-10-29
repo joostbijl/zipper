@@ -31,4 +31,7 @@ scripts/quick-actions.sh
 echo "Installed $DEST/Zipper.app"
 echo "Make it the default for a file type: right-click a .zip → Get Info → Open With → Zipper → Change All,"
 echo "or use the button in Zipper → Settings…"
-echo "If the Finder service does not appear: System Settings → Keyboard → Keyboard Shortcuts… → Services → Files and Folders."
+echo
+echo "Finder right-click items are registered but OFF until enabled once:"
+echo "  Quick Actions: right-click → Quick Actions → Customize… → tick the Zipper items"
+echo "  Services:      System Settings → Keyboard → Keyboard Shortcuts… → Services → Files and Folders → tick the Zipper items"

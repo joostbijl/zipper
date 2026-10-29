@@ -297,4 +297,4 @@ make_workflow "Open in Zipper" 'open -a Zipper "$@"' '				<string>public.zip-arc
 /System/Library/CoreServices/pbs -update >/dev/null 2>&1 || true
 echo "Installed Quick Actions in $SERVICES:"
 for n in "${NAMES[@]}"; do echo "  $n"; done
-echo "If they do not show in Finder's right-click menu: System Settings → Keyboard → Keyboard Shortcuts… → Services → Files and Folders, tick them."
+echo "They are OFF until enabled once: right-click → Quick Actions → Customize… → tick them."
