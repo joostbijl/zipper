@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>Zipper</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.jaxeadv.zipper</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Zipper</string>
+    <key>CFBundleDisplayName</key>
+    <string>Zipper</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSSupportsAutomaticTermination</key>
+    <false/>
+    <key>NSSupportsSuddenTermination</key>
+    <false/>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Zip archive</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.zip-archive</string>
+                <string>com.pkware.zip-archive</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>7-Zip archive</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>org.7-zip.7z-archive</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Tar archive</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.tar-archive</string>
+                <string>org.gnu.gnu-zip-tar-archive</string>
+                <string>org.bzip.bzip2-tar-archive</string>
+                <string>org.tukaani.tar-xz-archive</string>
+                <string>com.jaxeadv.zipper.tar-zstd-archive</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Compressed file</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>org.gnu.gnu-zip-archive</string>
+                <string>public.bzip2-archive</string>
+                <string>org.tukaani.xz-archive</string>
+                <string>com.jaxeadv.zipper.zstd-archive</string>
+            </array>
+        </dict>
+    </array>
+
+    <!-- UTIs macOS may not know. Identifiers the system already declares are
+         harmless to re-import; ours use our own prefix. -->
+    <key>UTImportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.7-zip.7z-archive</string>
+            <key>UTTypeDescription</key>
+            <string>7-Zip archive</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string><string>public.archive</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array><string>7z</string></array>
+                <key>public.mime-type</key>
+                <array><string>application/x-7z-compressed</string></array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.tukaani.xz-archive</string>
+            <key>UTTypeDescription</key>
+            <string>XZ compressed file</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string><string>public.archive</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array><string>xz</string></array>
+                <key>public.mime-type</key>
+                <array><string>application/x-xz</string></array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.tukaani.tar-xz-archive</string>
+            <key>UTTypeDescription</key>
+            <string>XZ compressed tar archive</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>org.tukaani.xz-archive</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array><string>tar.xz</string><string>txz</string></array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.bzip.bzip2-tar-archive</string>
+            <key>UTTypeDescription</key>
+            <string>bzip2 compressed tar archive</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.bzip2-archive</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array><string>tar.bz2</string><string>tbz2</string><string>tbz</string></array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.jaxeadv.zipper.zstd-archive</string>
+            <key>UTTypeDescription</key>
+            <string>Zstandard compressed file</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.data</string><string>public.archive</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array><string>zst</string></array>
+                <key>public.mime-type</key>
+                <array><string>application/zstd</string></array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.jaxeadv.zipper.tar-zstd-archive</string>
+            <key>UTTypeDescription</key>
+            <string>Zstandard compressed tar archive</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>com.jaxeadv.zipper.zstd-archive</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array><string>tar.zst</string><string>tzst</string></array>
+            </dict>
+        </dict>
+    </array>
+</dict>
+</plist>
