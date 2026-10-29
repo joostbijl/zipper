@@ -251,6 +251,18 @@ pub trait Archive: Send + Sync {
     /// Verify every entry can be decoded and checksums match.
     fn test(&self, password: Option<&str>, progress: ProgressFn<'_>, cancel: &Cancel)
         -> Result<()>;
+
+    /// Stream every entry for which `map` returns a new path into `builder`
+    /// (used by [`write::modify`]). Formats that cannot be written return
+    /// [`Error::ReadOnlyFormat`].
+    fn copy_into(
+        &self,
+        builder: &mut write::Builder,
+        map: &dyn Fn(&Entry) -> Option<PathBuf>,
+        password: Option<&str>,
+        progress: ProgressFn<'_>,
+        cancel: &Cancel,
+    ) -> Result<()>;
 }
 
 /// Open an archive, detecting its format from magic bytes (extension as fallback).

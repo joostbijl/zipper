@@ -120,4 +120,15 @@ impl Archive for StreamArchive {
         }
         Ok(())
     }
+
+    fn copy_into(
+        &self,
+        _builder: &mut crate::write::Builder,
+        _map: &dyn Fn(&Entry) -> Option<PathBuf>,
+        _password: Option<&str>,
+        _progress: ProgressFn<'_>,
+        _cancel: &Cancel,
+    ) -> Result<()> {
+        Err(Error::ReadOnlyFormat(self.format))
+    }
 }

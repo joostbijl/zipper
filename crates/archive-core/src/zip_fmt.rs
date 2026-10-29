@@ -220,6 +220,37 @@ impl Archive for ZipArchiveImpl {
         }
         Ok(())
     }
+
+    fn copy_into(
+        &self,
+        builder: &mut crate::write::Builder,
+        map: &dyn Fn(&Entry) -> Option<PathBuf>,
+        password: Option<&str>,
+        progress: ProgressFn<'_>,
+        cancel: &Cancel,
+    ) -> Result<()> {
+        let _ = password; // raw copies keep their original encryption
+        let mut zip = open_zip(&self.path)?;
+        let total = self.entries.len();
+        for (n, (e, &i)) in self.entries.iter().zip(&self.indices).enumerate() {
+            cancel.check()?;
+            let Some(new_path) = map(e) else { continue };
+            progress(&Progress {
+                done: 0,
+                total: None,
+                current: new_path.clone(),
+                entries_done: n,
+                entries_total: total,
+            });
+            let mut name = new_path.to_string_lossy().replace('\\', "/");
+            if e.kind == EntryKind::Dir && !name.ends_with('/') {
+                name.push('/');
+            }
+            let file = zip.by_index_raw(i)?;
+            builder.raw_copy_zip(file, &name)?;
+        }
+        Ok(())
+    }
 }
 
 fn map_zip_io(e: io::Error) -> Error {

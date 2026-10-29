@@ -1,5 +1,8 @@
-//! Creating archives (zip and 7z). Editing (add/remove/rename) is Phase 2
-//! and will be built on [`Builder`] with a rewrite-to-temp strategy.
+//! Creating and editing archives (zip and 7z).
+//!
+//! Editing never touches the original in place: [`modify`] streams the kept
+//! entries of the existing archive plus any new files into a `.part` file
+//! next to it and renames that over the original when everything succeeded.
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, Write};
@@ -18,6 +21,9 @@ pub struct WriteOptions {
     pub solid: bool,
     /// 7z only: also encrypt the file list (requires `password`).
     pub encrypt_header: bool,
+    /// Split the finished archive into volumes of this many bytes
+    /// (`name.7z.001`, `.002`, …). 7-Zip style; `None` = single file.
+    pub volume_size: Option<u64>,
 }
 
 impl Default for WriteOptions {
@@ -28,6 +34,7 @@ impl Default for WriteOptions {
             password: None,
             solid: false,
             encrypt_header: true,
+            volume_size: None,
         }
     }
 }
@@ -207,7 +214,50 @@ impl Builder {
         }
     }
 
-    /// Finish writing and move the temporary file to its final name.
+    /// Add a symbolic link entry.
+    pub fn add_symlink(
+        &mut self,
+        name: &str,
+        target: &Path,
+        modified: Option<SystemTime>,
+    ) -> Result<()> {
+        let p = crate::safe_path(name)?;
+        let name = p.to_string_lossy().replace('\\', "/");
+        let target_s = target.to_string_lossy().into_owned();
+        match &mut self.inner {
+            Inner::Zip(w) => {
+                let o = Self::zip_options(&self.opts, modified, Some(0o777));
+                w.add_symlink(name, target_s, o)?;
+            }
+            Inner::SevenZ(w) => {
+                let mut e = sevenz_rust2::ArchiveEntry::new_file(&name);
+                apply_sz_time(&mut e, modified);
+                e.has_windows_attributes = true;
+                e.windows_attributes = 0x8000 | (0o120777 << 16);
+                w.push_archive_entry(e, Some(target_s.as_bytes()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Zip only: copy an entry from another zip without recompressing or
+    /// re-encrypting it. Used by [`modify`] so edits are fast and lossless.
+    pub(crate) fn raw_copy_zip<R: Read>(
+        &mut self,
+        file: zip::read::ZipFile<'_, R>,
+        new_name: &str,
+    ) -> Result<()> {
+        match &mut self.inner {
+            Inner::Zip(w) => {
+                w.raw_copy_file_rename(file, new_name)?;
+                Ok(())
+            }
+            Inner::SevenZ(_) => Err(Error::Corrupt("raw copy into a 7z writer".into())),
+        }
+    }
+
+    /// Finish writing and move the temporary file to its final name
+    /// (or split it into volumes when `volume_size` is set).
     pub fn finish(mut self) -> Result<PathBuf> {
         self.finished = true;
         let inner = std::mem::replace(
@@ -226,11 +276,53 @@ impl Builder {
                 f.flush()?;
             }
         }
+        if let Some(size) = self.opts.volume_size.filter(|&s| s > 0) {
+            return self.split_volumes(size);
+        }
         if self.dest.exists() {
             fs::remove_file(&self.dest)?;
         }
         fs::rename(&self.tmp, &self.dest)?;
         Ok(self.dest.clone())
+    }
+
+    fn split_volumes(&self, size: u64) -> Result<PathBuf> {
+        let total = fs::metadata(&self.tmp)?.len();
+        let count = total.div_ceil(size).max(1);
+        let name = |i: u64| {
+            let base = self.dest.to_string_lossy().into_owned();
+            PathBuf::from(format!("{base}.{i:03}"))
+        };
+        // Remove stale volumes from an earlier run.
+        for i in 1..=9999u64 {
+            let p = name(i);
+            if p.exists() {
+                fs::remove_file(&p)?;
+            } else if i > count {
+                break;
+            }
+        }
+        let mut src = File::open(&self.tmp)?;
+        let mut buf = vec![0u8; BUF];
+        for i in 1..=count {
+            let mut out = BufWriter::new(File::create(name(i))?);
+            let mut left = size;
+            while left > 0 {
+                let want = buf.len().min(left as usize);
+                let n = src.read(&mut buf[..want])?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&buf[..n])?;
+                left -= n as u64;
+            }
+            out.flush()?;
+        }
+        fs::remove_file(&self.tmp)?;
+        if self.dest.exists() {
+            fs::remove_file(&self.dest)?;
+        }
+        Ok(name(1))
     }
 }
 
@@ -304,6 +396,49 @@ fn system_time_to_zip(t: SystemTime) -> Option<zip::DateTime> {
     .ok()
 }
 
+/// A file or folder on disk to add, with the entry path it gets inside the
+/// archive (`name` may contain `/` to place it under a folder).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    pub disk: PathBuf,
+    pub name: String,
+}
+
+impl Source {
+    /// Top-level entry named after the file name.
+    pub fn from_path(disk: &Path) -> Result<Self> {
+        let name = disk
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .ok_or_else(|| Error::UnsafePath(disk.to_path_buf()))?;
+        Ok(Self {
+            disk: disk.to_path_buf(),
+            name,
+        })
+    }
+}
+
+/// One item produced by walking sources: what `create`/`modify` will write.
+#[derive(Debug, Clone)]
+pub struct SourceItem {
+    pub disk: PathBuf,
+    pub name: String,
+    pub kind: crate::EntryKind,
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+}
+
+/// Expand sources recursively (directories first, children sorted).
+/// `.DS_Store` files are skipped; symlinks are kept as symlinks.
+pub fn list_sources(sources: &[Source]) -> Result<Vec<SourceItem>> {
+    let mut out = Vec::new();
+    for s in sources {
+        crate::safe_path(&s.name)?;
+        walk(&s.disk, &s.name, &mut out)?;
+    }
+    Ok(out)
+}
+
 /// Create an archive from filesystem paths. Each source becomes a top-level
 /// entry named after its file name; directories are added recursively.
 pub fn create(
@@ -313,49 +448,84 @@ pub fn create(
     progress: ProgressFn<'_>,
     cancel: &Cancel,
 ) -> Result<PathBuf> {
-    // Collect the file list first so progress has a total.
-    let mut files: Vec<(PathBuf, String, bool)> = Vec::new(); // (disk path, entry name, is_dir)
-    for src in sources {
-        let name = src
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .ok_or_else(|| Error::UnsafePath(src.clone()))?;
-        walk(src, &name, &mut files)?;
-    }
-    let total: u64 = files
+    let srcs = sources
         .iter()
-        .filter(|(_, _, d)| !d)
-        .filter_map(|(p, _, _)| fs::metadata(p).ok().map(|m| m.len()))
-        .sum();
+        .map(|p| Source::from_path(p))
+        .collect::<Result<Vec<_>>>()?;
+    create_from(dest, &srcs, opts, progress, cancel)
+}
 
+/// Create an archive from named sources.
+pub fn create_from(
+    dest: &Path,
+    sources: &[Source],
+    opts: &WriteOptions,
+    progress: ProgressFn<'_>,
+    cancel: &Cancel,
+) -> Result<PathBuf> {
+    let items = list_sources(sources)?;
     let mut b = Builder::create(dest, opts)?;
+    add_items(&mut b, &items, 0, progress, cancel)?;
+    b.finish()
+}
+
+fn add_items(
+    b: &mut Builder,
+    items: &[SourceItem],
+    entries_before: usize,
+    progress: ProgressFn<'_>,
+    cancel: &Cancel,
+) -> Result<u64> {
+    let total: u64 = items
+        .iter()
+        .filter(|i| i.kind == crate::EntryKind::File)
+        .map(|i| i.size)
+        .sum();
     let mut done = 0u64;
-    for (i, (disk, name, is_dir)) in files.iter().enumerate() {
+    for (i, item) in items.iter().enumerate() {
         cancel.check()?;
         progress(&Progress {
             done,
             total: Some(total),
-            current: PathBuf::from(name),
-            entries_done: i,
-            entries_total: files.len(),
+            current: PathBuf::from(&item.name),
+            entries_done: entries_before + i,
+            entries_total: entries_before + items.len(),
         });
-        let meta = fs::symlink_metadata(disk)?;
-        let modified = meta.modified().ok();
-        if *is_dir {
-            b.add_dir(name, modified)?;
-        } else {
-            let mode = unix_mode(&meta);
-            let f = File::open(disk)?;
-            done += b.add_file(name, f, modified, mode, cancel)?;
+        match item.kind {
+            crate::EntryKind::Dir => b.add_dir(&item.name, item.modified)?,
+            crate::EntryKind::Symlink => {
+                let target = fs::read_link(&item.disk)?;
+                b.add_symlink(&item.name, &target, item.modified)?;
+            }
+            crate::EntryKind::File => {
+                let meta = fs::metadata(&item.disk)?;
+                let f = File::open(&item.disk)?;
+                done += b.add_file(&item.name, f, item.modified, unix_mode(&meta), cancel)?;
+            }
         }
     }
-    b.finish()
+    Ok(done)
 }
 
-fn walk(path: &Path, name: &str, out: &mut Vec<(PathBuf, String, bool)>) -> Result<()> {
+fn walk(path: &Path, name: &str, out: &mut Vec<SourceItem>) -> Result<()> {
     let meta = fs::symlink_metadata(path)?;
-    if meta.is_dir() {
-        out.push((path.to_path_buf(), name.to_string(), true));
+    let modified = meta.modified().ok();
+    if meta.file_type().is_symlink() {
+        out.push(SourceItem {
+            disk: path.to_path_buf(),
+            name: name.to_string(),
+            kind: crate::EntryKind::Symlink,
+            size: 0,
+            modified,
+        });
+    } else if meta.is_dir() {
+        out.push(SourceItem {
+            disk: path.to_path_buf(),
+            name: name.to_string(),
+            kind: crate::EntryKind::Dir,
+            size: 0,
+            modified,
+        });
         let mut children: Vec<_> = fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
         children.sort_by_key(|e| e.file_name());
         for child in children {
@@ -366,10 +536,93 @@ fn walk(path: &Path, name: &str, out: &mut Vec<(PathBuf, String, bool)>) -> Resu
             walk(&child.path(), &format!("{name}/{cname}"), out)?;
         }
     } else if meta.is_file() {
-        out.push((path.to_path_buf(), name.to_string(), false));
+        out.push(SourceItem {
+            disk: path.to_path_buf(),
+            name: name.to_string(),
+            kind: crate::EntryKind::File,
+            size: meta.len(),
+            modified,
+        });
     }
-    // Symlinks and special files are skipped when creating (Phase 2 may revisit).
+    // Special files (sockets, devices) are skipped.
     Ok(())
+}
+
+/// A set of changes to apply to an existing archive in one rewrite.
+#[derive(Debug, Default, Clone)]
+pub struct Edit {
+    /// Entries to drop; a directory drops everything below it.
+    pub remove: Vec<PathBuf>,
+    /// `(from, to)` renames; a directory rename moves everything below it.
+    pub rename: Vec<(PathBuf, PathBuf)>,
+    /// New files/folders to add. An added name that already exists replaces
+    /// the old entry (and, for a folder, everything below it).
+    pub add: Vec<Source>,
+}
+
+impl Edit {
+    pub fn is_empty(&self) -> bool {
+        self.remove.is_empty() && self.rename.is_empty() && self.add.is_empty()
+    }
+
+    /// Where an existing entry ends up: `None` = dropped.
+    pub fn map(&self, path: &Path) -> Option<PathBuf> {
+        for r in &self.remove {
+            if path == r || path.starts_with(r) {
+                return None;
+            }
+        }
+        for a in &self.add {
+            let ap = Path::new(&a.name);
+            if path == ap || path.starts_with(ap) {
+                return None;
+            }
+        }
+        let mut p = path.to_path_buf();
+        for (from, to) in &self.rename {
+            if p == *from {
+                p = to.clone();
+                break;
+            }
+            if let Ok(rest) = p.strip_prefix(from) {
+                p = to.join(rest);
+                break;
+            }
+        }
+        Some(p)
+    }
+}
+
+/// Rewrite `archive` applying `edit`. Compression level, password and
+/// volume settings come from `opts`; the format is the archive's own.
+/// For zip, kept entries are copied byte-for-byte (no recompression).
+pub fn modify(
+    archive_path: &Path,
+    edit: &Edit,
+    opts: &WriteOptions,
+    progress: ProgressFn<'_>,
+    cancel: &Cancel,
+) -> Result<PathBuf> {
+    let archive = crate::open(archive_path, opts.password.as_deref())?;
+    let format = archive.format();
+    if !format.is_writable() {
+        return Err(Error::ReadOnlyFormat(format));
+    }
+    let items = list_sources(&edit.add)?;
+    let write_opts = WriteOptions {
+        format,
+        ..opts.clone()
+    };
+    let mut b = Builder::create(archive_path, &write_opts)?;
+    let kept = archive
+        .entries()
+        .iter()
+        .filter(|e| edit.map(&e.path).is_some())
+        .count();
+    let map = |e: &crate::Entry| edit.map(&e.path);
+    archive.copy_into(&mut b, &map, opts.password.as_deref(), progress, cancel)?;
+    add_items(&mut b, &items, kept, progress, cancel)?;
+    b.finish()
 }
 
 #[cfg(unix)]

@@ -341,4 +341,62 @@ impl Archive for SevenZArchive {
             Ok(())
         })
     }
+
+    fn copy_into(
+        &self,
+        builder: &mut crate::write::Builder,
+        map: &dyn Fn(&Entry) -> Option<PathBuf>,
+        password: Option<&str>,
+        progress: ProgressFn<'_>,
+        cancel: &Cancel,
+    ) -> Result<()> {
+        let password = self.effective_password(password);
+        let entries_total = self.entries.len();
+        let mut entry_of_file = vec![usize::MAX; self.meta.files.len()];
+        for (k, &fi) in self.file_index.iter().enumerate() {
+            entry_of_file[fi] = k;
+        }
+        // Directories and streamless entries first, then everything with data.
+        let mut wanted = Vec::new();
+        let mut n = 0usize;
+        for (k, e) in self.entries.iter().enumerate() {
+            let Some(new_path) = map(e) else { continue };
+            if e.kind == EntryKind::Dir {
+                builder.add_dir(&new_path.to_string_lossy(), e.modified)?;
+                n += 1;
+            } else {
+                wanted.push(self.file_index[k]);
+            }
+        }
+        let mut done = 0u64;
+        self.decode_blocks(&wanted, &password, cancel, |fi, sz_entry, reader| {
+            let e = &self.entries[entry_of_file[fi]];
+            let Some(new_path) = map(e) else {
+                io::copy(reader, &mut io::sink())?;
+                return Ok(());
+            };
+            progress(&Progress {
+                done,
+                total: None,
+                current: new_path.clone(),
+                entries_done: n,
+                entries_total,
+            });
+            n += 1;
+            let name = new_path.to_string_lossy().into_owned();
+            match e.kind {
+                EntryKind::Symlink => {
+                    let mut buf = Vec::new();
+                    reader.read_to_end(&mut buf)?;
+                    let target = PathBuf::from(String::from_utf8_lossy(&buf).into_owned());
+                    builder.add_symlink(&name, &target, e.modified)?;
+                }
+                _ => {
+                    done +=
+                        builder.add_file(&name, reader, e.modified, unix_mode(sz_entry), cancel)?;
+                }
+            }
+            Ok(())
+        })
+    }
 }
