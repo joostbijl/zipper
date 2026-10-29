@@ -195,6 +195,11 @@ define_class!(
         fn new_document_action(&self, _sender: Option<&AnyObject>) {
             new_document(Vec::new(), self.mtm());
         }
+
+        #[unsafe(method(showPreferences:))]
+        fn show_preferences(&self, _sender: Option<&AnyObject>) {
+            crate::prefs::show(self.mtm());
+        }
     }
 );
 
@@ -235,6 +240,8 @@ fn build_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
         "",
         mtm,
     ));
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    app_menu.addItem(&item("Settings…", Some(sel!(showPreferences:)), ",", mtm));
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     app_menu.addItem(&item("Hide Zipper", Some(sel!(hide:)), "h", mtm));
     let hide_others = item("Hide Others", Some(sel!(hideOtherApplications:)), "h", mtm);
@@ -299,6 +306,9 @@ fn build_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
         "\r",
         mtm,
     ));
+    let ql = item("Quick Look", Some(sel!(quickLookSelected:)), " ", mtm);
+    ql.setKeyEquivalentModifierMask(NSEventModifierFlags::empty());
+    arch_menu.addItem(&ql);
     arch_menu.addItem(&NSMenuItem::separatorItem(mtm));
     arch_menu.addItem(&item("Test Archive", Some(sel!(testArchive:)), "t", mtm));
     arch_item.setSubmenu(Some(&arch_menu));

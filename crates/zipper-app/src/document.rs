@@ -18,7 +18,8 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{
-    define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message,
+    define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadMarker,
+    MainThreadOnly, Message,
 };
 use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSBackingStoreType, NSBezelStyle, NSButton, NSControlStateValueOff,
@@ -37,6 +38,9 @@ use objc2_foundation::{
     NSOperationQueue, NSPoint, NSRect, NSSize, NSSortDescriptor, NSString, NSURL,
 };
 
+use crate::quicklook::{QLPreviewItem, QLPreviewPanel, QLPreviewPanelDataSource};
+
+use crate::prefs::{ExtractMode, Prefs};
 use archive_core::write::{self, Edit, Source, WriteOptions};
 use archive_core::{
     Archive, Cancel, ConflictAction, ConflictDecision, Entry, EntryKind, Error, ExtractOptions,
@@ -65,6 +69,7 @@ enum Job {
     Modify,
     Save,
     Promise,
+    QuickLook,
 }
 
 struct ProgressUi {
@@ -110,6 +115,9 @@ pub struct DocIvars {
     /// Drag-out promises waiting for their extraction to finish.
     promises: RefCell<HashMap<u64, PromiseBlock>>,
     next_promise: Cell<u64>,
+
+    /// Files currently shown in the Quick Look panel.
+    quick_look: RefCell<Vec<PathBuf>>,
 }
 
 define_class!(
@@ -191,6 +199,53 @@ define_class!(
         #[unsafe(method(saveFormatChanged:))]
         fn save_format_changed(&self, _sender: Option<&AnyObject>) {
             self.sync_save_ui();
+        }
+
+        #[unsafe(method(quickLookSelected:))]
+        fn quick_look_action(&self, _sender: Option<&AnyObject>) {
+            self.toggle_quick_look();
+        }
+
+        /// Sent by NSTableView/NSOutlineView when the space bar is pressed.
+        #[unsafe(method(quickLookPreviewItems:))]
+        fn quick_look_preview_items(&self, _sender: Option<&AnyObject>) {
+            self.toggle_quick_look();
+        }
+
+        // QLPreviewPanel controller protocol (informal, on NSObject).
+        #[unsafe(method(acceptsPreviewPanelControl:))]
+        fn accepts_preview_panel_control(&self, _panel: Option<&QLPreviewPanel>) -> bool {
+            true
+        }
+
+        #[unsafe(method(beginPreviewPanelControl:))]
+        fn begin_preview_panel_control(&self, panel: Option<&QLPreviewPanel>) {
+            if let Some(p) = panel {
+                unsafe { p.setDataSource(Some(ProtocolObject::from_ref(self))) };
+            }
+        }
+
+        #[unsafe(method(endPreviewPanelControl:))]
+        fn end_preview_panel_control(&self, panel: Option<&QLPreviewPanel>) {
+            if let Some(p) = panel {
+                unsafe { p.setDataSource(None) };
+            }
+        }
+    }
+
+    unsafe impl QLPreviewPanelDataSource for Document {
+        #[unsafe(method(numberOfPreviewItemsInPreviewPanel:))]
+        unsafe fn number_of_preview_items(&self, _panel: Option<&QLPreviewPanel>) -> isize {
+            self.ivars().quick_look.borrow().len() as isize
+        }
+
+        #[unsafe(method_id(previewPanel:previewItemAtIndex:))]
+        unsafe fn preview_item_at(&self, _panel: Option<&QLPreviewPanel>, index: isize) -> Option<Retained<ProtocolObject<dyn QLPreviewItem>>> {
+            self.ivars()
+                .quick_look
+                .borrow()
+                .get(index as usize)
+                .map(|p| ProtocolObject::from_retained(path_to_url(p)))
         }
     }
 
@@ -416,6 +471,14 @@ impl Document {
             self.can_edit() && has_selection && !busy
         } else if action == sel!(saveDocument:) {
             self.is_new() && !self.ivars().pending.borrow().is_empty() && !busy
+        } else if action == sel!(quickLookSelected:) {
+            // Never steal the space bar from a text field being edited.
+            let editing = self
+                .window()
+                .firstResponder()
+                .map(|r| r.isKindOfClass(objc2_app_kit::NSText::class()))
+                .unwrap_or(false);
+            has_selection && !editing
         } else {
             true
         }
@@ -548,7 +611,6 @@ impl Document {
             NSSize::new(100.0, 28.0),
         ));
         button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
-        button.setKeyEquivalent(ns_string!("\r"));
         button.setEnabled(false);
         bar.addSubview(&button);
 
@@ -878,6 +940,20 @@ impl Document {
         };
         let mtm = self.mtm();
         let archive_path = archive.path().to_path_buf();
+        let roots_len = self.ivars().roots.borrow().len();
+
+        // Preferences may skip the folder question.
+        let prefs = Prefs::load();
+        let fixed_dest = match prefs.extract_mode {
+            ExtractMode::Ask => None,
+            ExtractMode::ArchiveFolder => Some(default_extract_dir(&archive_path)),
+            ExtractMode::Fixed => prefs.extract_folder.clone(),
+        };
+        if let Some(dest) = fixed_dest {
+            let into_subfolder = selection.is_empty() && roots_len > 1;
+            self.run_extract(selection, dest, into_subfolder);
+            return;
+        }
 
         let panel = NSOpenPanel::openPanel(mtm);
         panel.setCanChooseDirectories(true);
@@ -911,7 +987,6 @@ impl Document {
         panel.setDirectoryURL(Some(&path_to_url(&start)));
 
         // Accessory: "Into a subfolder named after the archive".
-        let roots_len = self.ivars().roots.borrow().len();
         let checkbox = unsafe {
             NSButton::checkboxWithTitle_target_action(
                 &ns("Into a subfolder named after the archive"),
@@ -1039,8 +1114,11 @@ impl Document {
                 if urls.is_empty() {
                     urls.push(path_to_url(&root));
                 }
-                let arr = NSArray::from_retained_slice(&urls);
-                NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(&arr);
+                let prefs = Prefs::load();
+                if prefs.reveal {
+                    let arr = NSArray::from_retained_slice(&urls);
+                    NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(&arr);
+                }
                 let mut notes = Vec::new();
                 if !report.skipped_existing.is_empty() {
                     notes.push(format!(
@@ -1064,6 +1142,23 @@ impl Document {
                         s.push_str(&format!(" — {}", notes.join(", ")));
                     }
                     l.setStringValue(&ns(&s));
+                }
+                if prefs.trash_after_extract
+                    && selection.is_empty()
+                    && report.skipped_unsafe.is_empty()
+                {
+                    if let Some(p) = self.path() {
+                        let fm = objc2_foundation::NSFileManager::defaultManager();
+                        let ok = unsafe {
+                            fm.trashItemAtURL_resultingItemURL_error(&path_to_url(&p), None)
+                        }
+                        .is_ok();
+                        if ok {
+                            self.remove_temp_dir();
+                            self.window().close();
+                            return;
+                        }
+                    }
                 }
                 if !report.skipped_unsafe.is_empty() {
                     sheets::alert(
@@ -1667,6 +1762,7 @@ impl Document {
         };
         label("Format:", 94.0);
         let format = popup(94.0, &["zip", "7z"]);
+        format.selectItemAtIndex(crate::prefs::default_format_index());
         unsafe {
             format.setTarget(Some(me));
             format.setAction(Some(sel!(saveFormatChanged:)));
@@ -1922,6 +2018,130 @@ impl Document {
                 );
             }
         }
+    }
+
+    // ---------------------------------------------------------- quick look
+
+    fn quick_look_panel(&self) -> Option<Retained<QLPreviewPanel>> {
+        QLPreviewPanel::sharedPreviewPanel(self.mtm())
+    }
+
+    fn toggle_quick_look(&self) {
+        let mtm = self.mtm();
+        if QLPreviewPanel::sharedPreviewPanelExists(mtm) {
+            if let Some(p) = self.quick_look_panel() {
+                if p.isVisible() {
+                    p.orderOut(None);
+                    return;
+                }
+            }
+        }
+        if self.busy() {
+            return;
+        }
+        let nodes: Vec<Retained<Node>> = self
+            .selected_nodes()
+            .into_iter()
+            .filter(|n| !n.data().is_dir)
+            .collect();
+        if nodes.is_empty() {
+            return;
+        }
+        // Files on disk already (unsaved document) need no extraction.
+        let mut ready: Vec<PathBuf> = Vec::new();
+        let mut to_extract: Vec<PathBuf> = Vec::new();
+        let temp = self.temp_dir();
+        for n in &nodes {
+            let d = n.data();
+            if let Some(disk) = &d.disk {
+                ready.push(disk.clone());
+            } else if temp.join(&d.path).is_file() {
+                ready.push(temp.join(&d.path));
+            } else {
+                to_extract.push(d.path.clone());
+            }
+        }
+        if to_extract.is_empty() {
+            self.show_quick_look(ready);
+            return;
+        }
+        let Some(archive) = self.ivars().archive.borrow().clone() else {
+            self.show_quick_look(ready);
+            return;
+        };
+        if archive.needs_password() && self.ivars().password.borrow().is_none() {
+            let name = self.archive_name();
+            let h = self.handle();
+            sheets::ask_password(self.window(), &name, false, mtm, move |pw| {
+                h.on_main(move |doc, _| {
+                    if let Some(pw) = pw {
+                        *doc.ivars().password.borrow_mut() = Some(pw);
+                        doc.toggle_quick_look();
+                    }
+                });
+            });
+            return;
+        }
+        let password = self.ivars().password.borrow().clone();
+        let cancel = self.start_job(Job::QuickLook, "Preparing preview…");
+        let h = self.handle();
+        let all: Vec<PathBuf> = nodes.iter().map(|n| n.data().path.clone()).collect();
+        spawn("zipper-quicklook", move || {
+            let progress = throttled_progress(h.clone());
+            let opts = ExtractOptions {
+                overwrite: Overwrite::Always(ConflictAction::Replace),
+                password,
+                into_subfolder: false,
+                preserve_mtime: true,
+                strip_prefix: None,
+            };
+            let result = archive.extract(&to_extract, &temp, &opts, &progress, &cancel);
+            h.on_main(move |doc, mtm| {
+                if doc.ivars().closed.get() {
+                    return;
+                }
+                doc.end_job();
+                doc.update_status();
+                match result {
+                    Ok(_) => {
+                        let temp = doc.temp_dir();
+                        let paths: Vec<PathBuf> = nodes_paths_on_disk(&all, &ready, &temp);
+                        doc.show_quick_look(paths);
+                    }
+                    Err(Error::Cancelled) => {}
+                    Err(Error::WrongPassword) | Err(Error::PasswordRequired) => {
+                        *doc.ivars().password.borrow_mut() = None;
+                        sheets::alert(
+                            Some(doc.window()),
+                            "Wrong password",
+                            "The password was not accepted.",
+                            true,
+                            mtm,
+                        );
+                    }
+                    Err(e) => sheets::alert(
+                        Some(doc.window()),
+                        "Could not preview",
+                        &e.to_string(),
+                        true,
+                        mtm,
+                    ),
+                }
+            });
+        });
+    }
+
+    fn show_quick_look(&self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        *self.ivars().quick_look.borrow_mut() = paths;
+        let Some(panel) = self.quick_look_panel() else {
+            return;
+        };
+        unsafe { panel.setDataSource(Some(ProtocolObject::from_ref(self))) };
+        panel.reloadData();
+        panel.makeKeyAndOrderFront(None);
     }
 
     // ---------------------------------------------------------- jobs & progress sheet
@@ -2243,3 +2463,18 @@ fn icon_for(name: &str, is_dir: bool) -> Option<Retained<objc2_app_kit::NSImage>
 
 #[allow(dead_code)]
 fn _kinds(_: EntryKind) {}
+
+/// Quick Look item order follows the selection: disk files as they are,
+/// archive entries at their temp location.
+fn nodes_paths_on_disk(all: &[PathBuf], ready: &[PathBuf], temp: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for p in all {
+        let t = temp.join(p);
+        if t.is_file() {
+            out.push(t);
+        } else if let Some(r) = ready.iter().find(|r| r.file_name() == p.file_name()) {
+            out.push(r.clone());
+        }
+    }
+    out
+}

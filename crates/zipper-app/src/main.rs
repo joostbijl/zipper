@@ -6,6 +6,8 @@
 mod app;
 mod document;
 mod node;
+mod prefs;
+mod quicklook;
 mod sheets;
 mod tasks;
 mod util;
