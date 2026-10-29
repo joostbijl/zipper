@@ -46,8 +46,8 @@ Requires Rust ([rustup](https://rustup.rs)) and the Xcode Command Line Tools
 (`xcode-select --install`).
 
 ```sh
-git clone https://github.com/joostbijl/maczip.git
-cd maczip
+git clone https://github.com/joostbijl/zipper.git
+cd zipper
 scripts/install.sh
 ```
 
