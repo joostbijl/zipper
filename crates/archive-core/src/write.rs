@@ -212,7 +212,9 @@ impl Builder {
         self.finished = true;
         let inner = std::mem::replace(
             &mut self.inner,
-            Inner::Zip(Box::new(zip::ZipWriter::new(BufWriter::new(tempfile::tempfile()?)))),
+            Inner::Zip(Box::new(zip::ZipWriter::new(BufWriter::new(
+                tempfile::tempfile()?,
+            )))),
         );
         match inner {
             Inner::Zip(w) => {

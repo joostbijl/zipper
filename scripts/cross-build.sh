@@ -18,8 +18,11 @@ PROFILE="${PROFILE:-release}"
 cargo test -p archive-core --quiet
 
 if [[ "${1:-}" == "--check" ]]; then
-  # No SDK required: checking does not link.
-  cargo check -p zipper-app --target "$TARGET"
+  # Type-check the AppKit crate on the Linux host. No SDK and no Apple
+  # target needed: the objc2 crates are told to assume the GNUstep runtime,
+  # which is enough for `cargo check` (never for a build).
+  cargo check -p zipper-app --features linux-check
+  cargo clippy -p zipper-app --features linux-check
   exit 0
 fi
 

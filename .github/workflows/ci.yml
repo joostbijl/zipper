@@ -1,0 +1,38 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    name: engine tests + UI type-check (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo test -p archive-core
+      - run: cargo clippy -p archive-core --all-targets -- -D warnings
+      - run: cargo check -p zipper-app --features linux-check
+      - run: cargo clippy -p zipper-app --features linux-check -- -D warnings
+
+  macos:
+    name: build app (macOS, Apple Silicon)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p archive-core
+      - run: cargo build --release -p zipper-app --target aarch64-apple-darwin
+      - run: ./bundle.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Zipper.app
+          path: dist/Zipper.app

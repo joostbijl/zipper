@@ -6,7 +6,7 @@ inside it, or extract exactly the files you want to exactly the folder you
 want. See [SPEC.md](SPEC.md) for the full brief and [TESTING.md](TESTING.md)
 for the acceptance checklist.
 
-Status: **Phase 1 in progress** (open, browse, extract, test).
+Status: **Phase 1 written, awaiting first run on a Mac** (open, browse, extract, test).
 
 ## Formats
 
@@ -43,7 +43,10 @@ Copy `dist/Zipper.app.zip` to the Mac, unzip, run. The signature is ad-hoc,
 which is fine for your own machine; Gatekeeper may ask once (right-click →
 Open).
 
-`scripts/cross-build.sh --check` type-checks the UI crate without the SDK.
+`scripts/cross-build.sh --check` (or `cargo check -p zipper-app --features linux-check`)
+type-checks the AppKit crate on Linux without the SDK or the Apple target: it tells the
+`objc2` crates to assume the GNUstep runtime, which is enough for the compiler to verify
+every method name and signature. It is a check only, never a build.
 
 ## Tests
 

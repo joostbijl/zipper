@@ -11,5 +11,20 @@ description = "Native macOS archive manager (AppKit via objc2)"
 name = "Zipper"
 path = "src/main.rs"
 
+[features]
+# Type-check the AppKit code on Linux (no linking, no running). The objc2
+# crates refuse to compile for non-Apple targets unless told to assume the
+# GNUstep runtime; that assumption is only used for `cargo check`.
+#   cargo check -p zipper-app --features linux-check
+linux-check = ["objc2/gnustep-2-1", "block2/gnustep-2-1"]
+
 [dependencies]
 archive-core = { path = "../archive-core" }
+
+# AppKit bindings. Default features enable every class; cargo only builds
+# what is referenced.
+objc2 = "0.6"
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
