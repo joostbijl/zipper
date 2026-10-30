@@ -35,6 +35,17 @@
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.utilities</string>
 
+    <!-- zipper://add?p=…  used by the Finder Quick Action to add a selection. -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.jaxeadv.zipper.url</string>
+            <key>CFBundleURLSchemes</key>
+            <array><string>zipper</string></array>
+        </dict>
+    </array>
+
     <!-- Finder right-click → Services (or the Quick Actions / Services submenu). -->
     <key>NSServices</key>
     <array>

@@ -3,7 +3,7 @@
 //! "drop an archive here" window.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -83,7 +83,7 @@ pub fn pasteboard_paths(pb: &NSPasteboard) -> Vec<PathBuf> {
 pub fn open_paths(paths: Vec<PathBuf>, mtm: MainThreadMarker) {
     let mut sources = Vec::new();
     for p in paths {
-        if p.is_file() && archive_core::detect_format(&p).is_ok() {
+        if p.is_file() && looks_like_archive(&p) {
             open_path(p, mtm);
         } else if p.exists() {
             sources.push(p);
@@ -92,6 +92,72 @@ pub fn open_paths(paths: Vec<PathBuf>, mtm: MainThreadMarker) {
     if !sources.is_empty() {
         new_document(sources, mtm);
     }
+}
+
+/// Make one new archive from exactly these paths, whatever they are, and go
+/// straight to the Save panel. Used by the Finder service / Quick Action and
+/// the `--add` command-line flag.
+pub fn add_to_new_archive(paths: Vec<PathBuf>, mtm: MainThreadMarker) {
+    let paths: Vec<PathBuf> = paths.into_iter().filter(|p| p.exists()).collect();
+    if paths.is_empty() {
+        return;
+    }
+    activate(mtm);
+    let doc = Document::new_untitled(paths, mtm);
+    DOCUMENTS.with(|d| d.borrow_mut().push(doc.clone()));
+    close_empty_window();
+    doc.save_now();
+}
+
+/// Paths from a `zipper://add?p=…&p=…` URL (each `p` percent-encoded).
+fn zipper_url_paths(url: &NSURL) -> Vec<PathBuf> {
+    let Some(query) = url.query().map(|q| q.to_string()) else {
+        return vec![];
+    };
+    query
+        .split('&')
+        .filter_map(|kv| kv.strip_prefix("p="))
+        .map(percent_decode)
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// For a drop or a Finder "open": is this a file the user means as an
+/// archive? Zip-based document formats (Office, OpenDocument, jar, …) are
+/// zips technically, but dropping one on Zipper almost always means "put it
+/// in an archive", not "show me its XML".
+pub fn looks_like_archive(p: &Path) -> bool {
+    const DOCUMENT_EXTS: &[&str] = &[
+        "docx", "xlsx", "pptx", "docm", "xlsm", "pptm", "dotx", "xltx", "potx", "odt", "ods",
+        "odp", "odg", "jar", "war", "ear", "apk", "ipa", "epub", "pages", "numbers", "key",
+        "sketch", "xmind", "kmz", "vsdx", "whl", "crx", "xpi", "oxt",
+    ];
+    let ext = p
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if DOCUMENT_EXTS.contains(&ext.as_str()) {
+        return false;
+    }
+    archive_core::detect_format(p).is_ok()
 }
 
 /// A new, unsaved archive window.
@@ -171,16 +237,31 @@ define_class!(
 
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _n: &NSNotification) {
-            activate(self.mtm());
+            let mtm = self.mtm();
+            activate(mtm);
         }
 
         #[unsafe(method(application:openURLs:))]
         fn open_urls(&self, _app: &NSApplication, urls: &NSArray<NSURL>) {
             let mtm = self.mtm();
-            let paths: Vec<PathBuf> = (0..urls.count())
-                .filter_map(|i| url_to_path(&urls.objectAtIndex(i)))
-                .collect();
-            open_paths(paths, mtm);
+            let mut paths: Vec<PathBuf> = Vec::new();
+            let mut add: Vec<PathBuf> = Vec::new();
+            for i in 0..urls.count() {
+                let url = urls.objectAtIndex(i);
+                let scheme = url.scheme().map(|s| s.to_string()).unwrap_or_default();
+                if scheme.eq_ignore_ascii_case("zipper") {
+                    // zipper://add?p=<percent-encoded path>&p=…
+                    add.extend(zipper_url_paths(&url));
+                } else if let Some(p) = url_to_path(&url) {
+                    paths.push(p);
+                }
+            }
+            if !paths.is_empty() {
+                open_paths(paths, mtm);
+            }
+            if !add.is_empty() {
+                add_to_new_archive(add, mtm);
+            }
         }
 
         #[unsafe(method(applicationShouldOpenUntitledFile:))]
@@ -237,16 +318,7 @@ define_class!(
         // Finder service: selected files → new archive, straight to Save.
         #[unsafe(method(addToArchiveService:userData:error:))]
         fn add_to_archive_service(&self, pboard: &NSPasteboard, _user_data: Option<&NSString>, _error: *mut *mut NSString) {
-            let paths = pasteboard_paths(pboard);
-            if paths.is_empty() {
-                return;
-            }
-            let mtm = self.mtm();
-            activate(mtm);
-            let doc = Document::new_untitled(paths, mtm);
-            DOCUMENTS.with(|d| d.borrow_mut().push(doc.clone()));
-            close_empty_window();
-            doc.save_now();
+            add_to_new_archive(pasteboard_paths(pboard), self.mtm());
         }
 
         // Finder service: selected archives → open and extract everything.
@@ -522,4 +594,32 @@ pub fn show_empty_window(mtm: MainThreadMarker) {
     window.makeKeyAndOrderFront(None);
     EMPTY_WINDOW.with(|w| *w.borrow_mut() = Some(window));
     let _ = sheets::label; // keep module referenced
+}
+
+// These run on the Mac (`cargo test -p zipper-app`); on Linux the UI crate
+// cannot link, so they are checked but not run.
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_percent_and_plus() {
+        assert_eq!(
+            percent_decode("/Users/j/My%20File%2B1.png"),
+            "/Users/j/My File+1.png"
+        );
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("%C3%A9"), "é");
+    }
+
+    #[test]
+    fn office_files_are_not_archives() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("x.docx");
+        std::fs::write(&p, b"PK\x03\x04zzzz").unwrap();
+        assert!(!looks_like_archive(&p));
+        let z = d.path().join("x.zip");
+        std::fs::write(&z, b"PK\x03\x04zzzz").unwrap();
+        assert!(looks_like_archive(&z));
+    }
 }

@@ -30,6 +30,7 @@ jobs:
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p archive-core
+      - run: cargo test -p zipper-app --target aarch64-apple-darwin
       - run: cargo build --release -p zipper-app --target aarch64-apple-darwin
       - run: ./bundle.sh
       - uses: actions/upload-artifact@v4
