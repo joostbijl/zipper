@@ -431,11 +431,24 @@ pub struct SourceItem {
 /// Expand sources recursively (directories first, children sorted).
 /// `.DS_Store` files are skipped; symlinks are kept as symlinks.
 pub fn list_sources(sources: &[Source]) -> Result<Vec<SourceItem>> {
-    let mut out = Vec::new();
+    let mut out: Vec<SourceItem> = Vec::new();
     for s in sources {
         crate::safe_path(&s.name)?;
         walk(&s.disk, &s.name, &mut out)?;
     }
+    // Overlapping sources (a folder plus a file already inside it, or the
+    // same thing added twice) would produce the same entry name more than
+    // once, which a zip writer rejects. Keep the last occurrence.
+    let mut seen = std::collections::HashMap::new();
+    for (i, item) in out.iter().enumerate() {
+        seen.insert(item.name.clone(), i);
+    }
+    let out = out
+        .into_iter()
+        .enumerate()
+        .filter(|(i, item)| seen[&item.name] == *i)
+        .map(|(_, item)| item)
+        .collect();
     Ok(out)
 }
 

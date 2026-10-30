@@ -69,6 +69,20 @@ Then, one-time, because macOS keeps new third-party menu items off by default:
 
 Updating is the same `git pull && scripts/install.sh`.
 
+### Disk image
+
+```sh
+./bundle.sh && scripts/make-dmg.sh      # → dist/Zipper-<version>.dmg
+```
+
+Pushing a tag (`git tag v0.1.0 && git push --tags`) makes the GitHub macOS
+runner build the DMG and attach it to a release. Signing is ad-hoc unless the
+repository has a Developer ID certificate and notarization credentials as
+secrets (see `.github/workflows/release.yml`); ad-hoc images open on any Mac
+after one right-click → Open. The Linux builder cannot make a DMG: it has no
+`hdiutil`, and the Linux HFS+ tools are not something to ship an installer
+with. It produces `dist/Zipper.app.zip` instead.
+
 ### Build without installing
 
 ```sh

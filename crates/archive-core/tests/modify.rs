@@ -403,3 +403,55 @@ fn detects_iso_and_dmg_signatures() {
         assert!(matches!(open(&by_ext, None), Err(Error::UnsupportedFormat)));
     }
 }
+
+#[test]
+fn overlapping_sources_do_not_duplicate_entries() {
+    let d = tmp();
+    let root = d.path().join("root");
+    fs::create_dir_all(root.join("inputs/Logo")).unwrap();
+    fs::write(root.join("inputs/Logo/a.png"), b"a").unwrap();
+    fs::write(root.join("inputs/b.txt"), b"b").unwrap();
+    let sources = vec![
+        Source {
+            disk: root.join("inputs"),
+            name: "inputs".into(),
+        },
+        Source {
+            disk: root.join("inputs/Logo/a.png"),
+            name: "inputs/Logo/a.png".into(),
+        },
+        Source {
+            disk: root.join("inputs/Logo"),
+            name: "inputs/Logo".into(),
+        },
+        Source {
+            disk: root.join("inputs"),
+            name: "inputs".into(),
+        },
+    ];
+    let items = write::list_sources(&sources).unwrap();
+    let mut listed: Vec<_> = items.iter().map(|i| i.name.clone()).collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec!["inputs", "inputs/Logo", "inputs/Logo/a.png", "inputs/b.txt"]
+    );
+    for format in [Format::Zip, Format::SevenZ] {
+        let dest = d.path().join(format!("o.{}", format.extension()));
+        write::create_from(
+            &dest,
+            &sources,
+            &WriteOptions {
+                format,
+                ..Default::default()
+            },
+            NOOP,
+            &Cancel::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            names(&dest, None),
+            vec!["inputs", "inputs/Logo", "inputs/Logo/a.png", "inputs/b.txt"]
+        );
+    }
+}

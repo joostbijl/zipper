@@ -1,0 +1,54 @@
+name: Release
+# Push a tag like v0.1.0 to get a signed DMG attached to a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  dmg:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p archive-core
+      - run: cargo build --release -p zipper-app --target aarch64-apple-darwin
+      - run: ./bundle.sh
+
+      # Optional real signing: set these repository secrets to enable.
+      #   MACOS_CERT_P12_BASE64  base64 of a Developer ID Application .p12
+      #   MACOS_CERT_PASSWORD    its password
+      #   NOTARY_APPLE_ID, NOTARY_TEAM_ID, NOTARY_PASSWORD (app-specific password)
+      - name: Import signing certificate
+        if: ${{ env.CERT != '' }}
+        env:
+          CERT: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          echo "$CERT" | base64 --decode > cert.p12
+          security create-keychain -p ci build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security import cert.p12 -k build.keychain -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci build.keychain
+          IDENTITY=$(security find-identity -v -p codesigning build.keychain | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+      - name: Store notarization credentials
+        if: ${{ env.NOTARY_APPLE_ID != '' }}
+        env:
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: |
+          xcrun notarytool store-credentials zipper --apple-id "$NOTARY_APPLE_ID" --team-id "$NOTARY_TEAM_ID" --password "$NOTARY_PASSWORD"
+          echo "NOTARY_PROFILE=zipper" >> "$GITHUB_ENV"
+
+      - run: scripts/make-dmg.sh
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Zipper-*.dmg
+          generate_release_notes: true

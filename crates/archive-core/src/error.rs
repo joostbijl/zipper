@@ -41,6 +41,9 @@ impl From<zip::result::ZipError> for Error {
             Z::UnsupportedArchive(msg) if msg.contains("assword") => Error::PasswordRequired,
             Z::UnsupportedArchive(msg) => Error::Corrupt(format!("unsupported zip feature: {msg}")),
             Z::FileNotFound => Error::NotFound(PathBuf::new()),
+            Z::InvalidArchive(msg) if msg.starts_with("Duplicate filename") => {
+                Error::Corrupt("the same entry name occurs twice".into())
+            }
             Z::InvalidArchive(msg) => Error::Corrupt(msg.into_owned()),
             other => Error::Corrupt(other.to_string()),
         }
