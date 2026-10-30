@@ -285,7 +285,7 @@ PLIST
 mkdir -p "$SERVICES"
 # "Add": one archive from the whole selection, via the zipper://add URL
 # scheme (open -a would send archives to "open" and only the rest to "add").
-make_workflow "Add to Zipper Archive" 'q=""; for f in "$@"; do e=$(perl -e "\$_=shift; s/([^A-Za-z0-9._~\/-])/sprintf(q{%%%02X},ord(\$1))/ge; print" "$f"); q="${q:+$q&amp;}p=$e"; done; open "zipper://add?$q"' 
+make_workflow "Add to Zipper Archive" 'q=""; for f in "$@"; do e=$(perl -e "\$_=shift; s/([^A-Za-z0-9._~\/-])/sprintf(q{%%%02X},ord(\$1))/ge; print" "$f"); q="${q:+$q&amp;}p=$e"; done; open "zipper://add?$q"' '				<string>public.item</string>'
 make_workflow "Open in Zipper" 'open -a Zipper "$@"' '				<string>public.zip-archive</string>
 				<string>org.7-zip.7z-archive</string>
 				<string>public.tar-archive</string>
