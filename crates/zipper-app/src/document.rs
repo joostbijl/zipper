@@ -1719,7 +1719,15 @@ impl Document {
         panel.setCanCreateDirectories(true);
         panel.setAllowsOtherFileTypes(true);
         panel.setExtensionHidden(false);
-        panel.setMessage(Some(&ns("Save the new archive")));
+        panel.setMessage(Some(&ns(
+            "Save the new archive — format, compression and password are below the file name.",
+        )));
+        // Open expanded so the options accessory is visible at once. The
+        // property is settable only via KVC during configuration.
+        unsafe {
+            let yes = objc2_foundation::NSNumber::new_bool(true);
+            let _: () = msg_send![&*panel, setValue: &*yes, forKey: ns_string!("expanded")];
+        }
         let stem = Path::new(&pending[0].name)
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
